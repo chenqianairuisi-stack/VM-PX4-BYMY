@@ -1,0 +1,15 @@
+#!/bin/sh
+. etc/init.d-posix/rcS
+# Keyboard-only SITL: retain estimator/arming checks and land on Offboard loss.
+param set COM_RC_IN_MODE 4
+param set COM_RCL_EXCEPT 4
+param set NAV_DLL_ACT 0
+param set COM_OF_LOSS_T 1.0
+param set COM_OBL_RC_ACT 4
+param set MPC_XY_VEL_MAX 5.0
+param set MPC_Z_VEL_MAX_UP 2.5
+param set MPC_Z_VEL_MAX_DN 2.5
+param set MPC_ACC_HOR_MAX 4.0
+param set MPC_ACC_UP_MAX 4.0
+param set MPC_ACC_DOWN_MAX 4.0
+param set MPC_JERK_MAX 5.0

@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <world name="dual_uav_training">
+    <include><uri>model://sun</uri></include>
+    <include><uri>model://ground_plane</uri></include>
+
+    <!-- Target: camera-free FPV-like vehicle, controlled by the keyboard. -->
+    <include>
+      <uri>model://fpv_target</uri>
+      <name>target</name>
+      <!-- Start on the ground so the target cannot fall before the keyboard
+           node is ready. Press T to take it to flight altitude. -->
+      <pose>4 0 0.35 0 0 3.14159</pose>
+    </include>
+
+    <!-- Tracker: the only vehicle carrying the fixed forward RGB camera. -->
+    <include>
+      <uri>model://tracker_iris</uri>
+      <name>tracker</name>
+      <pose>0 0 0.35 0 0 0</pose>
+    </include>
+
+    <physics name="default_physics" type="ode">
+      <max_step_size>0.004</max_step_size>
+      <real_time_update_rate>250</real_time_update_rate>
+      <real_time_factor>1</real_time_factor>
+    </physics>
+    <gravity>0 0 -9.8066</gravity>
+    <magnetic_field>6.0e-6 2.3e-5 -4.2e-5</magnetic_field>
+    <!-- State services are available for test harnesses only. Guidance does
+         not consume target truth. Contact is evaluated at physics frequency. -->
+    <plugin name='gazebo_ros_state' filename='libgazebo_ros_state.so'/>
+    <plugin name='balloon_contact' filename='libballoon_contact.so'>
+      <balloon_radius>0.22</balloon_radius>
+    </plugin>
+    <!-- Gazebo's external camera is the two-vehicle god view. -->
+    <gui><camera name="god_view"><pose>-8 -10 8 0 0.55 0.85</pose></camera></gui>
+  </world>
+</sdf>
