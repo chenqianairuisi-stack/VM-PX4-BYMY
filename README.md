@@ -338,12 +338,6 @@ export PYTHONNOUSERSITE=1
 - 控制指令的坐标系和单位
 - 仿真与真实硬件之间的差异
 
-请勿直接将本项目用于未经测试的真实飞行器。
-
-## 许可证
-
-本项目采用 BSD 3-Clause License。
-
 PX4、ROS 2、Gazebo 和 `px4_msgs` 遵循其各自项目的许可证。
 ```
 
