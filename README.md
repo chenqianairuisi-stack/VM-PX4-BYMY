@@ -1,6 +1,3 @@
-下面这份可以直接复制到 GitHub 的 `README.md`：
-
-```markdown
 # PX4-FLY
 
 基于 **PX4 SITL、Gazebo Classic 和 ROS 2 Humble** 的无人机仿真与视觉跟随项目。
