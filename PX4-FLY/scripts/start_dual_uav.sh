@@ -32,8 +32,22 @@ mkdir -p "$REPO_DIR/runtime/dual/target" "$REPO_DIR/runtime/dual/tracker"
 
 pids=()
 cleanup() {
-  trap - EXIT INT TERM
+  trap - EXIT
+  # A second Ctrl-C must not interrupt cleanup and leave Gazebo behind.
+  trap '' INT TERM
   for pid in "${pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+  # Gazebo Classic can hang during shutdown. Bound the graceful wait, then
+  # terminate only the children started by this launcher before reaping them.
+  local attempt pid alive
+  for attempt in {1..30}; do
+    alive=0
+    for pid in "${pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then alive=1; fi
+    done
+    if (( alive == 0 )); then break; fi
+    sleep 0.1
+  done
+  for pid in "${pids[@]}"; do kill -KILL "$pid" 2>/dev/null || true; done
   for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
 }
 trap cleanup EXIT
@@ -50,18 +64,18 @@ if [[ "${HEADLESS:-0}" != 1 ]]; then
   pids+=("$!")
 fi
 
-# Instance 0 is the manually controlled target and publishes /fmu/*.
+# 两架无人机，o为手动控制的目标无人机，1为自主跟踪的无人机
 "$PX4_BUILD/bin/px4" -i 0 -d -s "$REPO_DIR/config/sitl.rc" \
   -w "$REPO_DIR/runtime/dual/target" "$PX4_BUILD/etc" \
   >"$REPO_DIR/runtime/dual/target/px4.log" 2>&1 &
 pids+=("$!")
 
-# Instance 1 is the autonomous tracker and publishes /px4_1/fmu/*.
 "$PX4_BUILD/bin/px4" -i 1 -d -s "$REPO_DIR/config/sitl.rc" \
   -w "$REPO_DIR/runtime/dual/tracker" "$PX4_BUILD/etc" \
   >"$REPO_DIR/runtime/dual/tracker/px4.log" 2>&1 &
 pids+=("$!")
 
+# 两架无人机的话题空间
 echo 'Dual simulation running.'
 echo 'Target PX4 topics: /fmu/*'
 echo 'Tracker PX4 topics: /px4_1/fmu/*'

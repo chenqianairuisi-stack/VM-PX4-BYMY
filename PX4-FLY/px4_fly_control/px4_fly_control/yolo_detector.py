@@ -1,8 +1,6 @@
-#!/usr/bin/env python3
-"""Optional timestamped YOLO adapter; supply balloon-specific weights."""
+# YOLOv8 目标检测运行代码
 
 from .detector_base import LatestFrameDetector, run_detector
-
 
 class YoloDetector(LatestFrameDetector):
     def __init__(self):

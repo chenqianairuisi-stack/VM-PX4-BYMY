@@ -86,7 +86,8 @@
       </axis>
     </joint>
     <link name='front_camera_link'>
-      <pose>0.24 0 0.02 0 0 0</pose>
+      <!-- Housing at the nose, with a solid mount overlapping the body. -->
+      <pose>0.17 0 0.02 0 0 0</pose>
       <inertial>
         <mass>0.01</mass>
         <inertia>
@@ -98,14 +99,26 @@
         <geometry><box><size>0.06 0.08 0.05</size></box></geometry>
         <material><ambient>0.08 0.08 0.08 1</ambient><diffuse>0.08 0.08 0.08 1</diffuse></material>
       </visual>
+      <visual name='front_camera_mount_visual'>
+        <pose>-0.07 0 -0.005 0 0 0</pose>
+        <geometry><box><size>0.12 0.06 0.03</size></box></geometry>
+        <material><ambient>0.15 0.15 0.15 1</ambient><diffuse>0.15 0.15 0.15 1</diffuse></material>
+      </visual>
+      <collision name='front_camera_housing_collision'>
+        <geometry><box><size>0.06 0.08 0.05</size></box></geometry>
+      </collision>
+      <collision name='front_camera_mount_collision'>
+        <pose>-0.07 0 -0.005 0 0 0</pose>
+        <geometry><box><size>0.12 0.06 0.03</size></box></geometry>
+      </collision>
       <sensor name='front_camera' type='camera'>
         <pose>0.04 0 0 0 0 0</pose>
         <always_on>true</always_on>
-        <update_rate>20</update_rate>
+        <update_rate>30</update_rate>
         <visualize>true</visualize>
         <camera>
           <horizontal_fov>1.3962634</horizontal_fov>
-          <image><width>640</width><height>480</height><format>R8G8B8</format></image>
+          <image><width>480</width><height>360</height><format>R8G8B8</format></image>
           <clip><near>0.05</near><far>100</far></clip>
         </camera>
         <plugin name='front_camera_ros' filename='libgazebo_ros_camera.so'>
@@ -453,7 +466,7 @@
       <rotorVelocitySlowdownSim>10</rotorVelocitySlowdownSim>
     </plugin>
     <include>
-      <uri>model://gps</uri>
+      <uri>model://stable_gps</uri>
       <pose>0.05 0 0.04 0 0 0</pose>
       <name>gps0</name>
     </include>

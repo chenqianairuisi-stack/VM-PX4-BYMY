@@ -13,3 +13,24 @@ param set MPC_ACC_HOR_MAX 4.0
 param set MPC_ACC_UP_MAX 4.0
 param set MPC_ACC_DOWN_MAX 4.0
 param set MPC_JERK_MAX 5.0
+# Offboard yaw setpoints use the attitude controller directly; AUTO yaw limits
+# alone do not constrain them. Keep a physical rate ceiling in addition to the
+# ROS reference's rate/acceleration limits (rad/s there, deg/s here).
+param set MC_YAWRATE_MAX 45.0
+# The target has a downward rangefinder. Slow the last metre of AUTO_LAND
+# to MPC_LAND_CRWL and shorten ground-contact confirmation. This is needed
+# because a fast first touchdown can corrupt the vertical estimate and make
+# the still-armed position controller lift the vehicle again.
+if [ "$px4_instance" = "0" ]; then
+  param set MPC_LAND_SPEED 0.6
+  param set LNDMC_Z_VEL_MAX 0.16
+  param set MPC_LAND_CRWL 0.2
+  param set LNDMC_TRIG_TIME 0.3
+  param set EKF2_RNG_POS_X 0.29
+  param set EKF2_RNG_POS_Z -0.04
+fi
+# Faster pursuit applies only to instance 1, the tracker in the dual world.
+if [ "$px4_instance" = "1" ]; then
+  param set MPC_XY_VEL_MAX 7.0
+  param set MC_YAWRATE_MAX 60.0
+fi

@@ -60,6 +60,54 @@ class Pose:
     rates: np.ndarray
 
 
+@dataclass
+class ExitObservation:
+    """Last camera bearing, including a partially clipped final frame."""
+
+    stamp: float
+    center_x: float
+    center_y: float
+    width: float
+    height: float
+    bearing: float
+    bearing_rate: float
+    camera_right: np.ndarray
+    clipped: bool
+
+
+def edge_recovery_hint(observation, pose, target_position, max_distance=2.7):
+    """Return a short body-side correction and yaw from the last image.
+
+    This is only for a nearby target leaving a specific image edge. A centered,
+    ambiguous or old observation does not authorize blind translation.
+    """
+    if observation is None or target_position is None:
+        return None
+    age = pose.stamp - observation.stamp
+    if age < 0 or age > 0.55:
+        return None
+    origin = np.asarray(pose.position, float)
+    if np.linalg.norm(np.asarray(target_position) - origin) > max_distance:
+        return None
+    side = observation.center_x - 0.5
+    vertical = observation.center_y - 0.5
+    horizontal_strength = float(np.clip((abs(side) - 0.18) / 0.27, 0, 1))
+    vertical_strength = float(np.clip((abs(vertical) - 0.20) / 0.25, 0, 1))
+    if max(horizontal_strength, vertical_strength) <= 0:
+        return None
+    # The final frame, not a possibly outdated inertial target velocity, sets
+    # the side to cover. Keep the correction under one body length.
+    right = np.asarray(observation.camera_right, float).copy()
+    right[2] = 0
+    right /= max(float(np.linalg.norm(right)), 1e-6)
+    offset = right * math.copysign(0.25 + 0.40 * horizontal_strength, side) * horizontal_strength
+    offset[2] = math.copysign(0.20 * vertical_strength, vertical)
+    yaw = wrap(observation.bearing + float(np.clip(
+        observation.bearing_rate * min(age, 0.25), -0.35, 0.35
+    )))
+    return offset, yaw
+
+
 class PoseHistory:
     def __init__(self, duration=3.0, extrapolation=0.08):
         self.samples = deque()
@@ -159,7 +207,7 @@ class CameraGeometry:
         width=640,
         height=480,
         hfov=math.radians(80),
-        offset=(0.28, 0, -0.02),
+        offset=(0.21, 0, -0.02),
         pitch=0.0,
     ):
         self.width, self.height = width, height
@@ -331,6 +379,36 @@ class VelocitySmoother:
         return self.velocity.copy()
 
 
+class YawSmoother:
+    """Shortest-path yaw reference with bounded rate and angular acceleration."""
+
+    def __init__(self, rate_limit=0.45, acceleration_limit=0.7):
+        if not all(math.isfinite(v) and v > 0 for v in (rate_limit, acceleration_limit)):
+            raise ValueError("Yaw limits must be positive and finite")
+        self.rate_limit = rate_limit
+        self.acceleration_limit = acceleration_limit
+        self.reset(0.0)
+
+    def reset(self, yaw):
+        self.yaw, self.rate = wrap(yaw), 0.0
+
+    def step(self, target, dt):
+        if dt <= 0:
+            return self.yaw
+        dt = min(dt, 0.1)
+        error = wrap(target - self.yaw)
+        # Proportional deceleration near the goal avoids a rate flip at arrival.
+        requested = float(np.clip(2.0 * error, -self.rate_limit, self.rate_limit))
+        previous = self.rate
+        self.rate += float(np.clip(
+            requested - self.rate,
+            -self.acceleration_limit * dt,
+            self.acceleration_limit * dt,
+        ))
+        self.yaw = wrap(self.yaw + 0.5 * (previous + self.rate) * dt)
+        return self.yaw
+
+
 def tracking_command(
     camera,
     pose,
@@ -342,21 +420,22 @@ def tracking_command(
     max_speed=5.0,
     max_vertical=2.0,
     edge_margin=0.12,
+    max_lookahead=0.8,
+    prediction_weight=1.0,
 ):
-    """Relative-velocity feedforward with short-horizon/FOV-aware correction.
+    """Relative-motion lookahead plus velocity feedforward in the NED frame.
 
-    This produces a velocity reference for existing PX4 inner loops, not a formal
-    FOV-invariant controller. Covariance and angular errors suppress closure.
+    Lead relative motion across the line of sight over a bounded time-to-go;
+    regulate radial closure by remaining distance without extrapolating past
+    contact. Yaw follows the current line of sight to retain the fixed-camera view.
+    This is a receding velocity reference, not a full trajectory optimizer.
     """
-    future = target_state[:3] + target_state[3:] * horizon
-    # Align the front contact point, accounting for body translation at close range.
-    relative = future - (pose.position + rotation(pose.q) @ camera.offset)
+    R = rotation(pose.q)
+    origin = pose.position + R @ camera.offset
+    relative = target_state[:3] - origin
     distance = float(np.linalg.norm(relative))
     yaw = math.atan2(relative[1], relative[0])
-    heading = np.array([math.cos(yaw), math.sin(yaw), 0.0])
-    along = float(relative @ heading)
-    transverse = relative - heading * along
-    uv = camera.project(future, pose)
+    uv = camera.project(target_state[:3], pose)
     visible = (
         uv is not None and np.all(uv > edge_margin) and np.all(uv < 1 - edge_margin)
     )
@@ -366,19 +445,46 @@ def tracking_command(
         visibility = float(np.clip(min(*uv, *(1 - uv)) / edge_margin, 0, 1))
     sigma = math.sqrt(max(0, float(np.linalg.eigvalsh(covariance[:3, :3])[-1])))
     certainty = float(np.clip(1 - sigma / max(0.5, distance * 0.6), 0, 1))
+    velocity_sigma = math.sqrt(max(0, float(np.linalg.eigvalsh(covariance[3:, 3:])[-1])))
+    # Keep long extrapolations out of the command while velocity is unobserved.
+    lead = min(max_lookahead, max(horizon, distance / max(closure, 0.3)))
+    lead = min(lead, max(horizon, 0.3 / max(velocity_sigma, 1e-6)))
+    weight = float(np.clip(prediction_weight, 0, 1))
+    target_velocity = limit_norm(target_state[3:], max_speed * 0.85) * weight
+    origin_velocity = pose.velocity + R @ np.cross(pose.rates, camera.offset)
+    # Only lead motion across the line of sight. Extrapolating radial closing
+    # motion through the target flips the reference behind us at close range,
+    # producing an unnecessary forward/reverse cycle. Radial speed is governed
+    # separately by remaining distance below.
+    line_of_sight = relative / max(distance, 1e-6)
+    relative_velocity = target_velocity - origin_velocity
+    transverse_velocity = relative_velocity - line_of_sight * float(
+        relative_velocity @ line_of_sight
+    )
+    lead_offset = limit_norm(transverse_velocity * lead * weight, 0.35 * distance)
+    predicted_relative = relative + lead_offset
+    direction = predicted_relative / max(float(np.linalg.norm(predicted_relative)), 1e-6)
     # Slow closure when below/above the target or when heading still lags.
-    attitude_yaw = math.atan2(rotation(pose.q)[1, 0], rotation(pose.q)[0, 0])
+    attitude_yaw = math.atan2(R[1, 0], R[0, 0])
     alignment = max(0.0, math.cos(wrap(yaw - attitude_yaw))) ** 4
-    vertical_alignment = 1 / (1 + (abs(transverse[2]) / max(0.3, along * 0.25)) ** 2)
+    horizontal_distance = float(np.linalg.norm(relative[:2]))
+    vertical_alignment = 1 / (1 + (abs(relative[2]) / max(0.3, horizontal_distance * 0.25)) ** 2)
     closing = (
-        min(closure, max(0.15, along - stand_off))
+        min(closure, max(0.0, distance - stand_off))
         * visibility
         * certainty
         * alignment
         * vertical_alignment
     )
-    feedforward = limit_norm(target_state[3:], max_speed * 0.85)
-    desired = feedforward + heading * closing + limit_norm(transverse * 0.8, 2.0)
+    # Forward feedforward also fades at the image edge; otherwise an uncertain
+    # target velocity can keep driving forward even after closure is suppressed.
+    forward = np.array([math.cos(attitude_yaw), math.sin(attitude_yaw), 0.0])
+    feedforward = target_velocity.copy()
+    advancing = max(0.0, float(feedforward @ forward))
+    feedforward -= forward * advancing * (1 - visibility * alignment)
+    desired = feedforward + direction * closing
+    # Vertical centering remains available even while forward closure is gated.
+    desired[2] = target_velocity[2] + weight * float(np.clip(predicted_relative[2] * 0.8, -2, 2))
     desired[:2] = limit_norm(desired[:2], max_speed)
     desired[2] = np.clip(desired[2], -max_vertical, max_vertical)
     # Reduce acceleration near a vertical edge so pitch does not remove target.

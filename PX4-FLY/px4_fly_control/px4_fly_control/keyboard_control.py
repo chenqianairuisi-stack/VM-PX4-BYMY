@@ -19,13 +19,23 @@ from px4_msgs.msg import (
 )
 from std_msgs.msg import Bool
 from builtin_interfaces.msg import Time
+from .visual_tracking import YawSmoother
 
 
 class KeyboardControl(Node):
     def __init__(self):
+        # 目标机键盘节点
         super().__init__('px4_fly_keyboard_control',
                          parameter_overrides=[Parameter('use_sim_time', value=True)])
         self.declare_parameter('takeoff_altitude', 1.5)
+        self.declare_parameter('yaw_rate_limit', 0.45)
+        self.declare_parameter('yaw_acceleration_limit', 0.7)
+        self.yaw_smoother = YawSmoother(
+            float(self.get_parameter('yaw_rate_limit').value),
+            float(self.get_parameter('yaw_acceleration_limit').value))
+        self.last_tick_sim = None
+
+        # 创建控制话题发布者
         self.mode_pub = self.create_publisher(OffboardControlMode, '/fmu/in/offboard_control_mode', 10)
         self.setpoint_pub = self.create_publisher(TrajectorySetpoint, '/fmu/in/trajectory_setpoint', 10)
         self.command_pub = self.create_publisher(VehicleCommand, '/fmu/in/vehicle_command', 10)
@@ -39,12 +49,15 @@ class KeyboardControl(Node):
         self.airborne_announced = False
         self.takeoff_event_pub.publish(Bool(data=False))
         self.airborne_stamp_pub.publish(Time())
+
+        # 订阅 PX4 位置、状态和姿态
         self.create_subscription(VehicleLocalPosition, '/fmu/out/vehicle_local_position',
                                  self.on_position, qos_profile_sensor_data)
         self.create_subscription(VehicleStatus, '/fmu/out/vehicle_status',
                                  self.on_status, qos_profile_sensor_data)
         self.create_subscription(VehicleAttitude, '/fmu/out/vehicle_attitude',
                                  self.on_attitude, qos_profile_sensor_data)
+
         self.roll = self.pitch = math.nan
         self.position = None
         self.status = None
@@ -88,10 +101,9 @@ class KeyboardControl(Node):
         self.lean = None
         self.target = [self.position.x, self.position.y, self.position.z]
         self.yaw = self.position.heading
+        self.yaw_smoother.reset(self.yaw)
 
     def timestamp(self):
-        # PX4 1.14 uCDR assigns its own receive time when timestamp is zero.
-        # This avoids wall-clock drift when Gazebo runs slower than real time.
         return 0
 
     def command(self, command, p1=0.0, p2=0.0):
@@ -116,6 +128,11 @@ class KeyboardControl(Node):
 
     def tick(self):
         now = time.monotonic()
+        sim_now = self.get_clock().now().nanoseconds * 1e-9
+        dt = 0.0 if self.last_tick_sim is None else max(0.0, min(0.1, sim_now - self.last_tick_sim))
+        if self.last_tick_sim is not None and sim_now < self.last_tick_sim:
+            self.yaw_smoother.reset(self.yaw)
+        self.last_tick_sim = sim_now
         self.check_airborne()
         if self.state == 'landing':
             if self.status is not None and not self.armed and now - self.last_command > 2.0:
@@ -138,6 +155,8 @@ class KeyboardControl(Node):
             return
         if self.stream_start is None:
             self.stream_start = now
+
+        # 周期性发布 Offboard 心跳和轨迹设定值
         mode = OffboardControlMode()
         mode.timestamp = self.timestamp()
         mode.position = True
@@ -160,8 +179,8 @@ class KeyboardControl(Node):
                 sp.acceleration = [scale * (forward * math.cos(heading) - right * math.sin(heading)),
                                    scale * (forward * math.sin(heading) + right * math.cos(heading)),
                                    math.nan]
-        sp.yaw = float(self.yaw)
-        sp.yawspeed = math.nan
+        sp.yaw = float(self.yaw_smoother.step(self.yaw, dt))
+        sp.yawspeed = float(self.yaw_smoother.rate)
         self.setpoint_pub.publish(sp)
         if self.state == 'starting':
             if self.armed and self.status.nav_state == VehicleStatus.NAVIGATION_STATE_OFFBOARD:
@@ -266,13 +285,12 @@ class KeyboardControl(Node):
             self.target[0] += forward * math.cos(heading) - right * math.sin(heading)
             self.target[1] += forward * math.sin(heading) + right * math.cos(heading)
             self.target[2] = min(-0.3, max(-20.0, self.target[2] - up))
-            # Keep a generous lead so repeated key presses can use the higher
-            # PX4 velocity limit without making the target sluggish.
+            # Bound the accumulated position error during repeated key presses.
             dx, dy = self.target[0] - self.position.x, self.target[1] - self.position.y
             distance = math.hypot(dx, dy)
-            if distance > 5.0:
-                self.target[0] = self.position.x + dx * 5.0 / distance
-                self.target[1] = self.position.y + dy * 5.0 / distance
+            if distance > 2.0:
+                self.target[0] = self.position.x + dx * 2.0 / distance
+                self.target[1] = self.position.y + dy * 2.0 / distance
             if key == 'j':
                 self.yaw -= math.radians(10)
             elif key == 'l':

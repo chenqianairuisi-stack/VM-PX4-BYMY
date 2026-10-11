@@ -25,8 +25,19 @@ export GAZEBO_MODEL_DATABASE_URI=""
 mkdir -p "$REPO_DIR/runtime"
 pids=()
 cleanup() {
-  trap - EXIT INT TERM
+  trap - EXIT
+  trap '' INT TERM
   for pid in "${pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+  local attempt pid alive
+  for attempt in {1..30}; do
+    alive=0
+    for pid in "${pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then alive=1; fi
+    done
+    if (( alive == 0 )); then break; fi
+    sleep 0.1
+  done
+  for pid in "${pids[@]}"; do kill -KILL "$pid" 2>/dev/null || true; done
   for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
 }
 trap cleanup EXIT

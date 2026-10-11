@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Timestamped HSV observations of the simulated red balloon."""
+# 红色目标检测运行代码
 
 import cv2
 from .detector_base import LatestFrameDetector, run_detector

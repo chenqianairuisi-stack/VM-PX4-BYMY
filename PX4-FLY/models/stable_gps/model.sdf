@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<sdf version="1.6">
+  <model name="stable_gps">
+    <link name="link">
+      <inertial>
+        <mass>0.015</mass>
+        <inertia><ixx>1e-05</ixx><iyy>1e-05</iyy><izz>1e-05</izz></inertia>
+      </inertial>
+      <sensor name="gps" type="gps">
+        <update_rate>10</update_rate>
+        <always_on>true</always_on>
+        <visualize>false</visualize>
+        <plugin name="gps_plugin" filename="libgazebo_gps_plugin.so">
+          <robotNamespace/>
+          <gpsNoise>true</gpsNoise>
+          <!-- Keep measurement noise, but avoid the multi-metre random walk of
+               the stock Iris GPS while holding a fixed point through 360°. -->
+          <gpsXYRandomWalk>0.05</gpsXYRandomWalk>
+          <gpsZRandomWalk>0.10</gpsZRandomWalk>
+          <gpsXYNoiseDensity>2.0e-5</gpsXYNoiseDensity>
+          <gpsZNoiseDensity>4.0e-5</gpsZNoiseDensity>
+          <gpsVXYNoiseDensity>0.02</gpsVXYNoiseDensity>
+          <gpsVZNoiseDensity>0.04</gpsVZNoiseDensity>
+        </plugin>
+      </sensor>
+    </link>
+  </model>
+</sdf>

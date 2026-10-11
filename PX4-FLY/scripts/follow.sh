@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 启动追踪器的环境准备和参数配置--启动包装
 set -eo pipefail
 export PYTHONNOUSERSITE=1
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

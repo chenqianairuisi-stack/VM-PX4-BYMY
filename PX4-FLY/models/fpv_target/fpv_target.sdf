@@ -49,6 +49,19 @@
           </script>
         </material>
       </visual>
+      <!-- The tether and balloon are drawings on the rigid body. They have no
+           mass, collision shape, or fixed-joint constraint to disturb landing.
+           The world plugin evaluates their moving center geometrically. -->
+      <visual name='tracking_tether_visual'>
+        <pose>0 0 -0.50 0 0 0</pose>
+        <geometry><cylinder><radius>0.010</radius><length>1.0</length></cylinder></geometry>
+        <material><ambient>0.03 0.03 0.03 1</ambient><diffuse>0.03 0.03 0.03 1</diffuse></material>
+      </visual>
+      <visual name='tracking_balloon_visual'>
+        <pose>0 0 -1.05 0 0 0</pose>
+        <geometry><sphere><radius>0.22</radius></sphere></geometry>
+        <material><ambient>0.95 0.02 0.02 1</ambient><diffuse>0.95 0.02 0.02 1</diffuse></material>
+      </visual>
       <gravity>1</gravity>
       <velocity_decay/>
     </link>
@@ -84,37 +97,6 @@
         </dynamics>
         <use_parent_model_frame>1</use_parent_model_frame>
       </axis>
-    </joint>
-    <!-- One 1 m rope hangs the balloon below the target. It is a single light
-         link with no hinge chain. The rope and balloon are visual-only; the
-         simulator contact plugin performs continuous geometric hit testing. -->
-    <link name='tracking_tether'>
-      <pose>0 0 -0.50 0 0 0</pose>
-      <inertial><mass>0.001</mass><inertia><ixx>1e-07</ixx><iyy>1e-07</iyy><izz>1e-07</izz><ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia></inertial>
-      <visual name='tracking_tether_visual'>
-        <geometry><cylinder><radius>0.010</radius><length>1.0</length></cylinder></geometry>
-        <material><ambient>0.03 0.03 0.03 1</ambient><diffuse>0.03 0.03 0.03 1</diffuse></material>
-      </visual>
-    </link>
-    <joint name='tracking_tether_joint' type='fixed'>
-      <parent>base_link</parent>
-      <child>tracking_tether</child>
-    </joint>
-    <link name='tracking_balloon'>
-      <pose>0 0 -1.05 0 0 0</pose>
-      <inertial>
-        <mass>0.005</mass>
-        <inertia><ixx>1e-06</ixx><iyy>1e-06</iyy><izz>1e-06</izz>
-          <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
-      </inertial>
-      <visual name='tracking_balloon_visual'>
-        <geometry><sphere><radius>0.22</radius></sphere></geometry>
-        <material><ambient>0.95 0.02 0.02 1</ambient><diffuse>0.95 0.02 0.02 1</diffuse></material>
-      </visual>
-    </link>
-    <joint name='tracking_balloon_joint' type='fixed'>
-      <parent>tracking_tether</parent>
-      <child>tracking_balloon</child>
     </joint>
     <link name='rotor_0'>
       <pose>0.13 -0.22 0.023 0 0 0</pose>
@@ -457,6 +439,18 @@
     <joint name='gps0_joint' type='fixed'>
       <child>gps0::link</child>
       <parent>base_link</parent>
+    </joint>
+    <!-- A forward-offset downward rangefinder remains clear of the airframe
+         and measures the last metre of descent. The red balloon is visual
+         only, so it cannot occlude this ray or create landing forces. -->
+    <include>
+      <uri>model://landing_lidar</uri>
+      <pose>0.29 0 0.04 0 0 0</pose>
+      <name>landing_lidar</name>
+    </include>
+    <joint name='landing_lidar_joint' type='fixed'>
+      <parent>base_link</parent>
+      <child>landing_lidar::link</child>
     </joint>
     <plugin name='groundtruth_plugin' filename='libgazebo_groundtruth_plugin.so'>
       <robotNamespace/>

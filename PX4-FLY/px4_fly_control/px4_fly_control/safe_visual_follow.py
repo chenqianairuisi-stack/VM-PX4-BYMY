@@ -1,10 +1,4 @@
-#!/usr/bin/env python3
-"""Predictive visual tracking for the dual-UAV balloon simulation.
-
-Only own PX4 telemetry and timestamped image observations enter tracking.
-A separate simulator referee reports contact; no target truth enters guidance.
-"""
-
+# 追踪器
 import math
 import time
 
@@ -36,11 +30,14 @@ from sensor_msgs.msg import CameraInfo
 from std_msgs.msg import Bool, String
 from .visual_tracking import (
     CameraGeometry,
+    ExitObservation,
     Pose,
     PoseHistory,
     Px4Clock,
     TargetFilter,
     VelocitySmoother,
+    YawSmoother,
+    edge_recovery_hint,
     tracking_command,
     rotation,
     wrap,
@@ -59,7 +56,8 @@ class SafeVisualFollow(Node):
         "LOCKING",
         "APPROACH",
         "FINAL",
-        "PREDICT",
+        "BRAKING",
+        "EDGE_RECOVERY",
         "REACQUIRE",
     )
 
@@ -85,27 +83,34 @@ class SafeVisualFollow(Node):
             "search_radius": 6.0,
             "target_hint_north": math.nan,
             "target_hint_east": math.nan,
-            "lock_frames": 4,
-            "lock_speed": 0.7,
-            "approach_speed": 3.0,
-            "final_speed": 1.2,
+            "lock_frames": 2,
+            "lock_speed": 1.4,
+            "approach_speed": 4.5,
+            "search_speed": 1.2,
+            "final_speed": 1.5,
             "final_distance": 1.5,
-            "max_follow_speed": 5.0,
-            "max_vertical_speed": 0.8,
+            "max_follow_speed": 7.0,
+            "max_vertical_speed": 1.2,
             "control_rate": 50.0,
             "command_acceleration": 3.0,
             "command_jerk": 6.0,
-            "yaw_rate_limit": 0.8,
-            "max_image_age": 0.35,
-            "fresh_timeout": 0.3,
-            "prediction_timeout": 0.55,
-            "prediction_sigma_limit": 1.0,
+            "yaw_rate_limit": 0.7,
+            "yaw_acceleration_limit": 1.2,
+            "max_image_age": 0.45,
+            "fresh_timeout": 0.25,
+            "prediction_timeout": 0.85,
+            "prediction_sigma_limit": 2.7,
+            "prediction_relative_sigma_limit": 0.3,
             "control_lookahead": 0.12,
-            "reacquire_time": 6.0,
+            "max_control_lookahead": 0.8,
+            "search_yaw_rate": 0.35,
+            "reacquire_yaw_rate": 0.6,
+            "edge_recovery_duration": 0.7,
+            "edge_recovery_distance": 2.7,
             "confidence_threshold": 0.55,
             "target_width_m": 0.44,
             "target_acceleration_noise": 3.0,
-            "camera_forward": 0.28,
+            "camera_forward": 0.21,
             "camera_right": 0.0,
             "camera_down": -0.02,
             "camera_pitch_deg": 0.0,
@@ -122,11 +127,30 @@ class SafeVisualFollow(Node):
             "max_follow_speed",
             "max_vertical_speed",
             "max_image_age",
+            "fresh_timeout",
             "prediction_timeout",
+            "prediction_sigma_limit",
+            "prediction_relative_sigma_limit",
+            "lock_speed",
             "target_width_m",
+            "yaw_rate_limit",
+            "yaw_acceleration_limit",
+            "search_speed",
+            "search_yaw_rate",
+            "reacquire_yaw_rate",
+            "edge_recovery_duration",
+            "edge_recovery_distance",
+            "control_lookahead",
+            "max_control_lookahead",
         ):
             if not math.isfinite(float(self.cfg[name])) or self.cfg[name] <= 0:
                 raise ValueError(f"{name} must be positive and finite")
+        if self.cfg["max_control_lookahead"] < self.cfg["control_lookahead"]:
+            raise ValueError("max_control_lookahead must be >= control_lookahead")
+        if self.cfg["fresh_timeout"] >= self.cfg["prediction_timeout"]:
+            raise ValueError("fresh_timeout must be less than prediction_timeout")
+        if int(self.cfg["lock_frames"]) < 1:
+            raise ValueError("lock_frames must be at least one")
         if not self.get_parameter("use_sim_time").value:
             raise ValueError(
                 "This SITL controller requires use_sim_time:=true and Gazebo /clock"
@@ -218,14 +242,14 @@ class SafeVisualFollow(Node):
         self.smoother = VelocitySmoother(
             float(self.cfg["command_acceleration"]), float(self.cfg["command_jerk"])
         )
+        self.yaw_smoother = YawSmoother(
+            float(self.cfg["yaw_rate_limit"]), float(self.cfg["yaw_acceleration_limit"])
+        )
         self.position = self.status = self.global_position = None
         self.position_wall = self.status_wall = self.odom_wall = 0.0
         self.reset_counter = None
         self.home = None
         self.yaw = 0.0
-        # Calibrated because this model's PX4 heading and attitude yaw use
-        # opposite signs relative to the fixed camera optical axis.
-        self.yaw_frame_offset = None
         self.target_takeoff_time = None
         self.burst_confirmed = False
         self.state = "WAIT_TARGET"
@@ -239,12 +263,29 @@ class SafeVisualFollow(Node):
         self.last_delay = math.nan
         self.pending_detection = None
         self.detection_streak = 0
-        self.search_index = 0
-        self.search_center = None
+        self.track_locked = False
+        self.search_position = None
+        self.search_scan_started = None
+        self.search_ready_since = None
+        self.search_yaw = 0.0
+        self.search_progress = 0.0
         self.reacquire_started = None
+        self.reacquire_scan_started = None
+        self.reacquire_yaw = 0.0
+        self.reacquire_position = None
+        self.reacquire_progress = 0.0
+        self.recovery_position = None
+        self.recovery_yaw = 0.0
+        self.recovery_started = None
+        self.last_seen = None
         self.last_target = None
         self.rejected_frames = 0
         self.accepted_frames = 0
+        self.processed_frames = 0
+        self.last_report_wall = time.monotonic()
+        self.last_report_accepted = 0
+        self.last_report_processed = 0
+        self.track_reason = "no observation"
         self.shutdown_reason = ""
         steady = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(1 / float(self.cfg["control_rate"]), self.tick, clock=steady)
@@ -341,21 +382,34 @@ class SafeVisualFollow(Node):
         self.last_frame_stamp = -1.0
         self.pending_detection = None
         self.detection_streak = 0
+        self.track_locked = False
+        self.reacquire_scan_started = None
+        self.reacquire_position = None
+        self.reacquire_progress = 0.0
+        self.search_position = None
+        self.search_scan_started = None
+        self.search_ready_since = None
+        self.search_progress = 0.0
+        self.recovery_position = None
+        self.recovery_started = None
+        self.last_seen = None
         self.last_frame_detected = False
         self.last_target = None
-        self.search_center = None
-        self.yaw_frame_offset = None
+        if self.position is not None:
+            self.yaw = float(self.position.heading)
+            self.reacquire_yaw = self.yaw
+            self.yaw_smoother.reset(self.yaw)
+            self.smoother.reset([self.position.vx, self.position.vy, self.position.vz])
 
     def setpoint_yaw_for_direction(self, direction_yaw, pose):
-        """Map a NED direction to the yaw convention expected by PX4."""
-        forward = rotation(pose.q) @ self.camera.body_from_camera @ np.array(
+        """Compensate camera mounting; odometry and setpoint both use NED yaw."""
+        R = rotation(pose.q)
+        forward = R @ self.camera.body_from_camera @ np.array(
             [0.0, 0.0, 1.0]
         )
         camera_yaw = math.atan2(float(forward[1]), float(forward[0]))
-        measured_heading = float(self.position.heading)
-        if self.yaw_frame_offset is None or not math.isfinite(self.yaw_frame_offset):
-            self.yaw_frame_offset = wrap(measured_heading - camera_yaw)
-        return wrap(float(direction_yaw) + self.yaw_frame_offset)
+        body_yaw = math.atan2(float(R[1, 0]), float(R[0, 0]))
+        return wrap(float(direction_yaw) + wrap(body_yaw - camera_yaw))
 
     def on_detection(self, msg):
         if seconds(msg.header.stamp) > self.last_frame_stamp:
@@ -395,12 +449,12 @@ class SafeVisualFollow(Node):
             return
         self.pending_detection = None
         self.last_frame_stamp = stamp
+        self.processed_frames += 1
         self.last_frame_detected = False
         self.last_delay = max(0.0, age)
         values = [msg.center_x, msg.center_y, msg.width, msg.height, msg.confidence]
-        valid = (
+        image_detection = (
             msg.detected
-            and not msg.clipped
             and np.isfinite(values).all()
             and 0 <= msg.center_x <= 1
             and 0 <= msg.center_y <= 1
@@ -408,8 +462,46 @@ class SafeVisualFollow(Node):
             and 0 < msg.height <= 1
             and msg.confidence >= self.cfg["confidence_threshold"]
         )
-        if not valid:
-            self.detection_streak = 0
+        observation = None
+        if image_detection:
+            R = rotation(pose.q)
+            ray = self.camera.ray(msg.center_x, msg.center_y)
+            direction = R @ self.camera.body_from_camera @ ray
+            bearing = math.atan2(float(direction[1]), float(direction[0]))
+            bearing_rate = 0.0
+            if self.last_seen is not None:
+                elapsed = stamp - self.last_seen.stamp
+                if 0.03 <= elapsed <= 0.35:
+                    bearing_rate = float(np.clip(
+                        wrap(bearing - self.last_seen.bearing) / elapsed, -1.5, 1.5
+                    ))
+            observation = ExitObservation(
+                stamp, msg.center_x, msg.center_y, msg.width, msg.height,
+                bearing, bearing_rate,
+                R @ self.camera.body_from_camera @ np.array([1.0, 0.0, 0.0]),
+                bool(msg.clipped),
+            )
+        if not image_detection or msg.clipped:
+            # A clipped sphere has unreliable size/range, but its last image
+            # bearing still tells us which side it exited. Only associate it
+            # with a recent existing track, never create one from a partial box.
+            if observation is not None and self.estimator.stamp is not None:
+                if stamp - self.estimator.stamp <= self.cfg["max_image_age"]:
+                    result = self.estimator.predict(stamp)
+                    uv = None if result is None else self.camera.project(result[0][:3], pose)
+                    if uv is not None and np.linalg.norm(
+                        uv - [msg.center_x, msg.center_y]
+                    ) < 0.55:
+                        self.last_seen = observation
+            # One skipped or clipped camera frame must not restart acquisition.
+            # The prediction timeout below expires the candidate instead.
+            if (
+                self.estimator.stamp is not None
+                and stamp - self.estimator.stamp > self.cfg["prediction_timeout"]
+            ):
+                self.estimator.clear()
+                self.detection_streak = 0
+                self.track_locked = False
             return
         if (
             self.estimator.stamp is not None
@@ -417,6 +509,7 @@ class SafeVisualFollow(Node):
         ):
             self.estimator.clear()
             self.detection_streak = 0
+            self.track_locked = False
         try:
             point, covariance = self.camera.observe(
                 values[:4], pose, float(self.cfg["target_width_m"])
@@ -428,11 +521,14 @@ class SafeVisualFollow(Node):
             self.rejected_frames += 1
             self.detection_streak = 0
             return
-        self.detection_streak += 1
+        self.detection_streak = min(self.detection_streak + 1, int(self.cfg["lock_frames"]))
+        if self.detection_streak >= self.cfg["lock_frames"]:
+            self.track_locked = True
         self.last_frame_detected = True
         self.last_valid_wall = time.monotonic()
         self.accepted_frames += 1
         self.last_target = point.copy()
+        self.last_seen = observation
 
     def ready(self):
         p = self.position
@@ -474,19 +570,18 @@ class SafeVisualFollow(Node):
         mode.velocity = velocity
         self.mode_pub.publish(mode)
 
-    def send_position(self, point):
+    def send_position(self, point, yaw_rate=math.nan):
         self.heartbeat()
         sp = TrajectorySetpoint()
         sp.timestamp = 0
         sp.position = [float(v) for v in point]
         sp.velocity = sp.acceleration = sp.jerk = [math.nan] * 3
         sp.yaw = float(self.yaw)
-        sp.yawspeed = math.nan
+        sp.yawspeed = float(yaw_rate)
         self.setpoint_pub.publish(sp)
 
     def turn_towards(self, yaw, dt):
-        step = float(self.cfg["yaw_rate_limit"]) * dt
-        self.yaw = wrap(self.yaw + float(np.clip(wrap(yaw - self.yaw), -step, step)))
+        self.yaw = self.yaw_smoother.step(yaw, dt)
 
     def send_velocity(self, desired, dt, acceleration_scale=1.0):
         desired = np.array(desired, float)
@@ -518,63 +613,38 @@ class SafeVisualFollow(Node):
         sp.velocity = [float(v) for v in velocity]
         sp.acceleration = sp.jerk = [math.nan] * 3
         sp.yaw = float(self.yaw)
-        sp.yawspeed = math.nan
+        sp.yawspeed = float(self.yaw_smoother.rate)
         self.setpoint_pub.publish(sp)
 
-    def search_points(self):
-        center_n = float(self.cfg["target_hint_north"])
-        center_e = float(self.cfg["target_hint_east"])
-        if not math.isfinite(center_n):
-            center_n = float(self.cfg["search_north"])
-        if not math.isfinite(center_e):
-            center_e = float(self.cfg["search_east"])
-        half = max(1.0, float(self.cfg["search_size"]) / 2)
-        own = self.global_position
-        lat, lon = self.cfg["search_latitude"], self.cfg["search_longitude"]
-        if math.isfinite(lat) and math.isfinite(lon) and own is not None:
-            center_n = self.position.x + (lat - own.lat) * 111111.0
-            center_e = self.position.y + (lon - own.lon) * 111111.0 * math.cos(
-                math.radians(own.lat)
-            )
-            half = max(1.0, float(self.cfg["search_radius"]))
-        altitude = self.home[2] - abs(float(self.cfg["search_altitude"]))
-        if self.search_center is not None:
-            center_n, center_e, altitude = self.search_center
-            altitude = float(
-                np.clip(
-                    altitude,
-                    self.home[2] - self.cfg["maximum_height"],
-                    self.home[2] - self.cfg["minimum_height"],
-                )
-            )
-        return [
-            (center_n + dn, center_e + de, altitude)
-            for dn, de in [
-                (0, 0),
-                (-half, -half),
-                (-half, half),
-                (0, half),
-                (0, -half),
-                (half, -half),
-                (half, half),
-            ]
-        ]
-
     def track_available(self, now):
-        if (
-            self.estimator.stamp is None
-            or now - self.estimator.stamp > self.cfg["prediction_timeout"]
-        ):
+        if self.estimator.stamp is None:
+            self.track_reason = "no observation"
+            return None
+        if now - self.estimator.stamp > self.cfg["prediction_timeout"]:
+            self.track_reason = "observation expired"
             return None
         if time.monotonic() - self.last_valid_wall > 2.0:
+            self.track_reason = "detector stalled"
             return None
         result = self.estimator.predict(now)
         if result is None:
+            self.track_reason = "prediction unavailable"
             return None
-        _, P = result
+        x, P = result
         sigma = math.sqrt(max(0.0, float(np.linalg.eigvalsh(P[:3, :3])[-1])))
-        if sigma > self.cfg["prediction_sigma_limit"]:
+        # Camera range error grows with distance. A fixed 1 m cap rejected a
+        # perfectly visible balloon beyond ~10 m and left SEARCH turning in
+        # place. Bound both absolute and range-relative uncertainty instead.
+        origin = self.history.samples[-1].position if self.history.samples else np.zeros(3)
+        distance = float(np.linalg.norm(x[:3] - origin))
+        limit = max(
+            float(self.cfg["prediction_sigma_limit"]),
+            float(self.cfg["prediction_relative_sigma_limit"]) * distance,
+        )
+        if sigma > limit:
+            self.track_reason = f"uncertain {sigma:.2f}/{limit:.2f}m"
             return None
+        self.track_reason = "tracking"
         return result
 
     def tick(self):
@@ -610,6 +680,7 @@ class SafeVisualFollow(Node):
         if self.home is None:
             self.home = (self.position.x, self.position.y, self.position.z)
             self.yaw = self.position.heading
+            self.yaw_smoother.reset(self.yaw)
         if self.stream_start is None:
             self.stream_start = wall
         self.process_detection(now)
@@ -667,100 +738,238 @@ class SafeVisualFollow(Node):
             self.send_position((self.home[0], self.home[1], altitude))
             if abs(self.position.z - altitude) < 0.25:
                 self.state = "SEARCH"
+                if pose is not None:
+                    self.begin_search(pose)
                 self.smoother.reset(
                     [self.position.vx, self.position.vy, self.position.vz]
                 )
             return
         if pose is None:
-            # Coordinate/time alignment is unavailable; keep sending a bounded
-            # braking command. Visual loss alone never starts automatic landing.
-            self.send_velocity(np.zeros(3), dt)
+            # Preserve a latched hold point even through a short odometry gap.
+            self.turn_towards(self.yaw, dt)
+            point = {
+                "SEARCH": self.search_position,
+                "EDGE_RECOVERY": self.recovery_position,
+                "REACQUIRE": self.reacquire_position,
+            }.get(self.state)
+            if point is not None:
+                self.send_position(point, self.yaw_smoother.rate)
+            else:
+                self.send_velocity(np.zeros(3), dt)
             if wall - self.odom_wall > 2.0:
                 self.request_land("own time-aligned odometry unavailable (failsafe)")
             return
         estimate = self.track_available(now)
-        if estimate is not None:
-            x, P = estimate
-            if self.state in ("SEARCH", "REACQUIRE"):
-                self.smoother.reset(pose.velocity)
-                self.yaw = self.position.heading
-            lost = (
-                not self.last_frame_detected
+        # A visible edge exit is stronger evidence than a delayed camera frame.
+        # React while the last bearing is still recent; the longer prediction
+        # grace period must not disable the existing close-range side recovery.
+        if (
+            estimate is not None
+            and self.last_seen is not None
+            and self.last_seen.stamp >= self.estimator.stamp - 1e-6
+            and (
+                self.last_seen.clipped
                 or now - self.estimator.stamp > self.cfg["fresh_timeout"]
             )
-            if lost:
-                self.state = "PREDICT"
-                closure = self.cfg["lock_speed"] * max(
-                    0.0,
-                    1 - (now - self.estimator.stamp) / self.cfg["prediction_timeout"],
-                )
-            elif self.detection_streak < self.cfg["lock_frames"]:
+            and edge_recovery_hint(
+                self.last_seen, pose, self.last_target,
+                float(self.cfg["edge_recovery_distance"]),
+            ) is not None
+        ):
+            estimate = None
+            self.track_reason = "nearby image edge exit"
+        if estimate is not None:
+            if self.state in ("BRAKING", "REACQUIRE", "EDGE_RECOVERY"):
+                # Return from PX4 position hold with a fresh, measured velocity
+                # reference, not the stale pre-loss pursuit command.
+                self.smoother.reset(pose.velocity)
+                self.yaw = math.atan2(rotation(pose.q)[1, 0], rotation(pose.q)[0, 0])
+                self.yaw_smoother.reset(self.yaw)
+            x, P = estimate
+            distance = np.linalg.norm(x[:3] - pose.position)
+            # Blend closure continuously while observations remain valid.
+            blend = float(np.clip(
+                (distance - self.cfg["final_distance"])
+                / max(0.1, self.cfg["final_distance"]), 0.0, 1.0,
+            ))
+            blend = blend * blend * (3 - 2 * blend)
+            closure = self.cfg["final_speed"] + blend * (
+                self.cfg["approach_speed"] - self.cfg["final_speed"]
+            ) if self.track_locked else self.cfg["lock_speed"]
+            if not self.track_locked:
                 self.state = "LOCKING"
-                closure = self.cfg["lock_speed"]
-            elif np.linalg.norm(x[:3] - pose.position) < self.cfg["final_distance"]:
-                self.state = "FINAL"
-                closure = self.cfg["final_speed"]
             else:
-                self.state = "APPROACH"
-                closure = self.cfg["approach_speed"]
+                self.state = "FINAL" if distance < self.cfg["final_distance"] else "APPROACH"
+            # Start a bounded approach on the first reliable observation. New
+            # frames can then refine the path while the aircraft accelerates.
+            # On a gap, reduce closure continuously instead of switching PX4
+            # straight into position hold and re-accelerating each frame.
+            age = max(0.0, now - self.estimator.stamp)
+            coasting = age > self.cfg["fresh_timeout"]
+            fade = float(np.clip(
+                (self.cfg["prediction_timeout"] - age)
+                / (self.cfg["prediction_timeout"] - self.cfg["fresh_timeout"]),
+                0.0, 1.0,
+            ))
+            fade = fade * fade * (3.0 - 2.0 * fade)
             desired, yaw, scale, _ = tracking_command(
                 self.camera,
                 pose,
                 x,
                 P,
-                float(closure),
+                float(closure) * fade,
                 float(self.cfg["control_lookahead"]),
                 max_speed=float(self.cfg["max_follow_speed"]),
                 max_vertical=float(self.cfg["max_vertical_speed"]),
+                max_lookahead=float(self.cfg["max_control_lookahead"]),
+                prediction_weight=fade,
             )
+            if coasting:
+                # Use the predicted bearing to steer without asking for more
+                # horizontal speed. Existing acceleration winds down under
+                # the jerk limit rather than jumping to zero.
+                limit = float(np.linalg.norm(pose.velocity[:2])) * fade
+                speed = float(np.linalg.norm(desired[:2]))
+                if speed > limit:
+                    desired[:2] *= limit / max(speed, 1e-6)
             self.turn_towards(self.setpoint_yaw_for_direction(yaw, pose), dt)
             self.send_velocity(desired, dt, scale)
             self.last_target = x[:3].copy()
             self.reacquire_started = None
+            self.reacquire_scan_started = None
+            self.reacquire_position = None
+            self.recovery_position = None
             return
-        if self.state not in ("SEARCH", "REACQUIRE"):
-            self.state = "REACQUIRE"
-            self.reacquire_started = now
-            self.detection_streak = 0
-        if self.state == "REACQUIRE":
-            if self.reacquire_started is None:
-                self.reacquire_started = now
-            elapsed = now - self.reacquire_started
-            center = self.last_target
-            direction = (
-                self.yaw
-                if center is None
-                else math.atan2(
-                    center[1] - pose.position[1], center[0] - pose.position[0]
-                )
+        if self.state == "SEARCH":
+            self.hold_and_scan(pose, now, dt, searching=True)
+            return
+        if self.state not in ("BRAKING", "EDGE_RECOVERY", "REACQUIRE"):
+            hint = edge_recovery_hint(
+                self.last_seen, pose, self.last_target,
+                float(self.cfg["edge_recovery_distance"]),
             )
-            direction += 0.6 * math.sin(1.2 * elapsed)
-            if center is None:
-                self.turn_towards(direction, dt)
+            self.detection_streak = 0
+            self.track_locked = False
+            self.estimator.clear()
+            if hint is not None:
+                offset, self.recovery_yaw = hint
+                self.recovery_position = pose.position + offset
+                self.recovery_position[2] = float(np.clip(
+                    self.recovery_position[2],
+                    self.home[2] - self.cfg["maximum_height"],
+                    self.home[2] - self.cfg["minimum_height"],
+                ))
+                self.recovery_started = now
+                self.state = "EDGE_RECOVERY"
             else:
-                self.turn_towards(self.setpoint_yaw_for_direction(direction, pose), dt)
-            self.send_velocity(np.zeros(3), dt)
-            if (
-                elapsed >= self.cfg["reacquire_time"]
-                and np.linalg.norm(pose.velocity) < 0.3
-            ):
-                self.state = "SEARCH"
-                self.search_center = None if center is None else center.copy()
-                self.search_index = 0
+                if np.linalg.norm(pose.velocity) > 0.2:
+                    # Stay in velocity mode until the aircraft has actually
+                    # slowed; a position setpoint at cruise speed is an abrupt
+                    # brake. Match the first braking command to measured speed.
+                    self.state = "BRAKING"
+                    self.smoother.reset(pose.velocity)
+                else:
+                    self.state = "REACQUIRE"
+                    self.begin_reacquire(pose, now)
+        if self.state == "BRAKING":
+            if np.linalg.norm(pose.velocity) < 0.2:
+                self.state = "REACQUIRE"
+                self.begin_reacquire(pose, now)
+            else:
+                self.turn_towards(self.yaw, dt)
+                self.send_velocity(np.zeros(3), dt)
+                return
+        if self.state == "EDGE_RECOVERY":
+            if now - self.recovery_started >= self.cfg["edge_recovery_duration"]:
+                self.state = "REACQUIRE"
+                self.begin_reacquire(pose, now, self.recovery_position)
+            else:
+                self.turn_towards(self.recovery_yaw, dt)
+                self.send_position(self.recovery_position, self.yaw_smoother.rate)
+                return
+        if self.state == "REACQUIRE":
+            self.hold_and_scan(pose, now, dt)
             return
-        points = self.search_points()
-        point = points[self.search_index % len(points)]
-        delta = np.array(point) - pose.position
-        if np.linalg.norm(delta) < 0.7:
-            self.search_index += 1
-            point = points[self.search_index % len(points)]
-            delta = np.array(point) - pose.position
-        self.turn_towards(
-            self.setpoint_yaw_for_direction(math.atan2(delta[1], delta[0]), pose), dt
+
+    def begin_search(self, pose):
+        """Start scanning at one position; no waypoint search is permitted."""
+        yaw = math.atan2(rotation(pose.q)[1, 0], rotation(pose.q)[0, 0])
+        self.search_position = pose.position.copy()
+        self.search_scan_started = None
+        self.search_ready_since = None
+        self.search_progress = 0.0
+        self.search_yaw = yaw
+        self.yaw_smoother.reset(yaw)
+        self.yaw = yaw
+
+    def begin_reacquire(self, pose, now, anchor=None):
+        yaw = math.atan2(rotation(pose.q)[1, 0], rotation(pose.q)[0, 0])
+        self.reacquire_position = (
+            pose.position.copy() if anchor is None else np.asarray(anchor, float).copy()
         )
-        self.send_position(point)
+        self.reacquire_started = now
+        self.reacquire_scan_started = None
+        self.reacquire_progress = 0.0
+        self.reacquire_yaw = yaw
+        self.yaw_smoother.reset(yaw)
+        self.yaw = yaw
+
+    def hold_and_scan(self, pose, now, dt, searching=False):
+        """Hold a fixed point while turning; SEARCH repeats, REACQUIRE stops."""
+        measured_yaw = math.atan2(rotation(pose.q)[1, 0], rotation(pose.q)[0, 0])
+        if searching:
+            if self.search_position is None:
+                self.begin_search(pose)
+            anchor = self.search_position
+            started = self.search_scan_started
+            start_yaw = self.search_yaw
+            progress = self.search_progress
+        else:
+            if self.reacquire_position is None:
+                self.begin_reacquire(pose, now)
+            anchor = self.reacquire_position
+            started = self.reacquire_scan_started
+            start_yaw = self.reacquire_yaw
+            progress = self.reacquire_progress
+        speed = float(np.linalg.norm(pose.velocity))
+        error = float(np.linalg.norm(pose.position - anchor))
+        if searching and started is None:
+            # First settle at the takeoff hold point before beginning the
+            # panorama. Yaw during the residual climb creates a visible arc.
+            if speed < 0.12 and error < 0.15:
+                if self.search_ready_since is None:
+                    self.search_ready_since = now
+                elif now - self.search_ready_since >= 0.5:
+                    started = now
+            else:
+                self.search_ready_since = None
+        elif started is None and speed < 0.2 and error < 0.25:
+            started = now
+        if started is not None and dt > 0:
+            # Never let the yaw reference race ahead of the measured aircraft.
+            if abs(wrap(start_yaw + progress - measured_yaw)) < 0.35:
+                configured_rate = self.cfg["search_yaw_rate" if searching else "reacquire_yaw_rate"]
+                rate = min(configured_rate, self.cfg["yaw_rate_limit"])
+                progress += rate * dt
+                if searching:
+                    progress %= 2 * math.pi
+                else:
+                    progress = min(2 * math.pi, progress)
+        if searching:
+            self.search_scan_started, self.search_progress = started, progress
+        else:
+            self.reacquire_scan_started, self.reacquire_progress = started, progress
+        self.turn_towards(wrap(start_yaw + progress), dt)
+        self.send_position(anchor, self.yaw_smoother.rate)
 
     def report(self):
+        wall = time.monotonic()
+        interval = max(1e-3, wall - self.last_report_wall)
+        detector_fps = (self.processed_frames - self.last_report_processed) / interval
+        accepted_fps = (self.accepted_frames - self.last_report_accepted) / interval
+        self.last_report_wall = wall
+        self.last_report_processed = self.processed_frames
+        self.last_report_accepted = self.accepted_frames
         age = (
             math.nan
             if self.estimator.stamp is None
@@ -769,7 +978,11 @@ class SafeVisualFollow(Node):
         text = (
             f"{self.state}: camera={self.camera_ready} odometry={bool(self.history.samples)} "
             f"capture_age={age:.3f}s image_delay={self.last_delay:.3f}s "
-            f"accepted={self.accepted_frames} rejected={self.rejected_frames}"
+            f"frames={detector_fps:.1f}/s valid={accepted_fps:.1f}/s "
+            f"cmd_xy={np.linalg.norm(self.smoother.velocity[:2]):.2f}m/s "
+            f"lock={self.detection_streak}/{self.cfg['lock_frames']} "
+            f"track={self.track_reason} accepted={self.accepted_frames} "
+            f"rejected={self.rejected_frames}"
         )
         self.get_logger().info(text)
         msg = String()

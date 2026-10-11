@@ -4,13 +4,17 @@ import math
 import numpy as np
 from px4_fly_control.visual_tracking import (
     CameraGeometry,
+    ExitObservation,
     Pose,
     PoseHistory,
     Px4Clock,
     TargetFilter,
     VelocitySmoother,
+    YawSmoother,
+    wrap,
     rotation,
     tracking_command,
+    edge_recovery_hint,
 )
 
 
@@ -112,7 +116,7 @@ def test_known_sphere_size_recovers_range_and_camera_offset():
         radius_px = camera.fx * math.tan(math.asin(0.22 / distance))
         box = [0.5, 0.5, 2 * radius_px / camera.width, 2 * radius_px / camera.height]
         point, cov = camera.observe(box, pose(), 0.44)
-        np.testing.assert_allclose(point, [distance + 0.28, 0, -0.02], atol=1e-10)
+        np.testing.assert_allclose(point, [distance + camera.offset[0], 0, -0.02], atol=1e-10)
         assert np.linalg.eigvalsh(cov).min() > 0
 
 
@@ -189,3 +193,96 @@ def test_falling_acceleration_cap_does_not_break_jerk_limit():
     a = smoother.acceleration.copy()
     smoother.step([0, 0, 0], 0.02, acceleration_limit=0.3)
     assert np.linalg.norm(smoother.acceleration - a) <= 0.12000001
+
+
+def test_yaw_step_reversal_and_wrap_respect_rate_and_acceleration():
+    smoother = YawSmoother()
+    smoother.reset(math.radians(179))
+    previous_yaw, previous_rate = smoother.yaw, smoother.rate
+    for i in range(500):
+        goal = math.radians(-150) if i < 100 else math.radians(150)
+        yaw = smoother.step(goal, 0.02)
+        assert abs(wrap(yaw - previous_yaw)) / 0.02 <= 0.45 + 1e-9
+        assert abs(smoother.rate - previous_rate) / 0.02 <= 0.7 + 1e-9
+        if i == 0:
+            assert wrap(yaw - previous_yaw) > 0  # Short arc across +pi.
+        previous_yaw, previous_rate = yaw, smoother.rate
+    assert abs(wrap(yaw - goal)) < 0.001
+    assert abs(smoother.rate) < 0.001
+    assert smoother.step(0.0, 0.0) == yaw  # Paused simulation.
+
+
+def test_matching_velocity_does_not_add_spurious_lateral_lead():
+    camera = CameraGeometry()
+    target = np.array([6.0, 0, -0.02, 0, 1.5, 0])
+    command, yaw, _, _ = tracking_command(
+        camera, pose(velocity=(0, 1.5, 0)), target, np.eye(6) * 0.001, 2.0, 0.12
+    )
+    assert abs(command[1] - 1.5) < 1e-9
+    assert abs(yaw) < 1e-9
+
+
+def test_lateral_prediction_leads_motion_but_camera_faces_current_target():
+    camera = CameraGeometry()
+    target = np.array([6.0, 0, -0.02, 0, 1.5, 0])
+    command, yaw, _, visible = tracking_command(
+        camera, pose(), target, np.eye(6) * 0.001, 2.0, 0.12
+    )
+    assert command[1] > 1.5  # Lead compensates the pursuer's velocity lag.
+    assert abs(yaw) < 1e-9 and visible
+    uncertain = np.eye(6) * 0.001
+    uncertain[3:, 3:] = np.eye(3) * 9.0
+    cautious, _, _, _ = tracking_command(camera, pose(), target, uncertain, 2.0, 0.12)
+    assert cautious[1] < command[1]
+
+
+def test_prediction_expiry_brakes_target_velocity_feedforward():
+    target = np.array([6.0, 0, 1.0, 3, 1, 0.5])
+    command, _, _, _ = tracking_command(
+        CameraGeometry(), pose(), target, np.eye(6) * 0.001,
+        0.0, 0.12, prediction_weight=0.0,
+    )
+    np.testing.assert_allclose(command, np.zeros(3), atol=1e-12)
+
+
+def test_closing_fast_does_not_reverse_before_reaching_target():
+    camera = CameraGeometry()
+    own = pose(velocity=(2.0, 0.0, 0.0))
+    for distance in (0.4, 0.62, 1.0, 2.0):
+        target = np.array([distance + camera.offset[0], 0, -0.02, 0, 0, 0])
+        command, _, _, _ = tracking_command(
+            camera, own, target, np.eye(6) * 0.001, 1.2, 0.12
+        )
+        assert command[0] > 0  # Decelerate toward a positive speed, not reverse.
+        assert command[0] <= min(distance, 1.2)
+        np.testing.assert_allclose(command[1:], 0.0, atol=1e-12)
+
+
+def test_large_lateral_velocity_error_cannot_turn_correction_sideways():
+    camera = CameraGeometry()
+    target = np.array([1.0, 0, -0.02, 0, 0, 0])
+    command, _, _, _ = tracking_command(
+        camera, pose(velocity=(2.0, 4.0, 0)), target, np.eye(6) * 0.001, 1.2, 0.12
+    )
+    assert command[0] > 0
+    assert abs(command[1] / command[0]) <= 0.35 + 1e-9
+
+
+def test_last_camera_edge_sets_bounded_recovery_side_and_yaw():
+    own = pose(stamp=10.2)
+    for x, sign in ((0.92, 1), (0.08, -1)):
+        last = ExitObservation(
+            10.1, x, 0.5, 0.10, 0.10, sign * 0.6, sign * 0.5,
+            np.array([0.0, 1.0, 0.0]), True,
+        )
+        offset, yaw = edge_recovery_hint(last, own, [1.0, 0, 0])
+        assert np.sign(offset[1]) == sign
+        assert 0 < np.linalg.norm(offset) <= 0.65 + 1e-9
+        assert np.sign(yaw) == sign and abs(yaw) > 0.6
+        assert edge_recovery_hint(last, own, [4.0, 0, 0]) is None
+        assert edge_recovery_hint(last, pose(stamp=11.0), [1.0, 0, 0]) is None
+    middle = ExitObservation(
+        10.1, 0.5, 0.5, 0.05, 0.05, 0, 0,
+        np.array([0, 1, 0]), False,
+    )
+    assert edge_recovery_hint(middle, own, [1.0, 0, 0]) is None

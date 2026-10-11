@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 查看实时画面，订阅并且显示相机图像
 set -eo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source /opt/ros/humble/setup.bash
