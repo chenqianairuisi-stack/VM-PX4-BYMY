@@ -6,13 +6,13 @@ param set COM_RCL_EXCEPT 4
 param set NAV_DLL_ACT 0
 param set COM_OF_LOSS_T 1.0
 param set COM_OBL_RC_ACT 4
-param set MPC_XY_VEL_MAX 5.0
+param set MPC_XY_VEL_MAX 7.0
 param set MPC_Z_VEL_MAX_UP 2.5
 param set MPC_Z_VEL_MAX_DN 2.5
-param set MPC_ACC_HOR_MAX 4.0
+param set MPC_ACC_HOR_MAX 5.5
 param set MPC_ACC_UP_MAX 4.0
 param set MPC_ACC_DOWN_MAX 4.0
-param set MPC_JERK_MAX 5.0
+param set MPC_JERK_MAX 7.0
 # Offboard yaw setpoints use the attitude controller directly; AUTO yaw limits
 # alone do not constrain them. Keep a physical rate ceiling in addition to the
 # ROS reference's rate/acceleration limits (rad/s there, deg/s here).
@@ -31,6 +31,6 @@ if [ "$px4_instance" = "0" ]; then
 fi
 # Faster pursuit applies only to instance 1, the tracker in the dual world.
 if [ "$px4_instance" = "1" ]; then
-  param set MPC_XY_VEL_MAX 7.0
+  param set MPC_XY_VEL_MAX 8.0
   param set MC_YAWRATE_MAX 60.0
 fi

@@ -56,6 +56,7 @@ class SafeVisualFollow(Node):
         "LOCKING",
         "APPROACH",
         "FINAL",
+        "PREDICT_CONTACT",
         "BRAKING",
         "EDGE_RECOVERY",
         "REACQUIRE",
@@ -73,7 +74,7 @@ class SafeVisualFollow(Node):
             "detection_topic": "/tracker/yolo/detection",
             "px4_timestamp_mode": "dds",
             "takeoff_altitude": 2.5,
-            "target_hint_delay": 10.0,
+            "target_hint_delay": 2.0,
             "search_north": 4.0,
             "search_east": 0.0,
             "search_size": 6.0,
@@ -89,6 +90,10 @@ class SafeVisualFollow(Node):
             "search_speed": 1.2,
             "final_speed": 1.5,
             "final_distance": 1.5,
+            "near_prediction_distance": 1.2,
+            "near_prediction_timeout": 1.5,
+            "near_prediction_speed": 2.0,
+            "near_prediction_max_sigma": 0.6,
             "max_follow_speed": 7.0,
             "max_vertical_speed": 1.2,
             "control_rate": 50.0,
@@ -108,8 +113,24 @@ class SafeVisualFollow(Node):
             "edge_recovery_duration": 0.7,
             "edge_recovery_distance": 2.7,
             "confidence_threshold": 0.55,
+            "tracking_confidence_threshold": 0.55,
             "target_width_m": 0.44,
+            "target_geometry": "sphere",
+            "stand_off": 0.0,
+            "virtual_contact_mode": False,
+            "virtual_contact_threshold": 3.5,
+            "braking_latency": 0.25,
+            "braking_deceleration": 1.2,
+            "max_retreat_speed": 1.0,
             "target_acceleration_noise": 3.0,
+            "target_acceleration_limit": 0.0,
+            "prediction_yaw_weight": 0.0,
+            "yaw_prediction_time": 0.35,
+            "navigation_gain": 0.0,
+            "turn_rate_budget": 0.0,
+            "max_turn_standoff": 12.0,
+            "partial_box_min_width": 0.03,
+            "partial_box_max_range": 12.0,
             "camera_forward": 0.21,
             "camera_right": 0.0,
             "camera_down": -0.02,
@@ -120,10 +141,38 @@ class SafeVisualFollow(Node):
         for name, value in defaults.items():
             self.declare_parameter(name, value)
         self.cfg = {name: self.get_parameter(name).value for name in defaults}
+        if self.cfg["target_geometry"] not in ("sphere", "drone"):
+            raise ValueError("target_geometry must be sphere or drone")
+        if not math.isfinite(self.cfg["stand_off"]) or self.cfg["stand_off"] < 0:
+            raise ValueError("stand_off must be finite and nonnegative")
+        if not math.isfinite(self.cfg["braking_latency"]) or self.cfg["braking_latency"] < 0:
+            raise ValueError("braking_latency must be finite and nonnegative")
+        for name in ("target_acceleration_limit", "turn_rate_budget", "prediction_yaw_weight", "navigation_gain"):
+            if not math.isfinite(self.cfg[name]) or self.cfg[name] < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if self.cfg["prediction_yaw_weight"] > 1:
+            raise ValueError("prediction_yaw_weight must not exceed one")
+        if not (0 < self.cfg["tracking_confidence_threshold"] <= self.cfg["confidence_threshold"] <= 1):
+            raise ValueError("Require 0 < tracking_confidence_threshold <= confidence_threshold <= 1")
+        if (self.cfg["target_geometry"] == "drone"
+                and not self.cfg["virtual_contact_mode"]
+                and self.cfg["stand_off"] < 2.0):
+            raise ValueError("Drone following requires stand_off >= 2 m")
+        if self.cfg["virtual_contact_mode"]:
+            if self.cfg["target_geometry"] != "drone":
+                raise ValueError("Virtual contact requires drone target geometry")
+            if self.cfg["stand_off"] != 0.0:
+                raise ValueError("Virtual contact requires stand_off = 0 m")
+            if self.cfg["virtual_contact_threshold"] < 0.5:
+                raise ValueError("Virtual contact threshold must be >= 0.5 m")
+            if self.cfg["near_prediction_distance"] <= self.cfg["virtual_contact_threshold"]:
+                raise ValueError("near_prediction_distance must exceed virtual_contact_threshold")
         for name in (
             "control_rate",
             "command_acceleration",
             "command_jerk",
+            "braking_deceleration",
+            "max_retreat_speed",
             "max_follow_speed",
             "max_vertical_speed",
             "max_image_age",
@@ -142,6 +191,14 @@ class SafeVisualFollow(Node):
             "edge_recovery_distance",
             "control_lookahead",
             "max_control_lookahead",
+            "near_prediction_distance",
+            "near_prediction_timeout",
+            "near_prediction_speed",
+            "near_prediction_max_sigma",
+            "yaw_prediction_time",
+            "max_turn_standoff",
+            "partial_box_min_width",
+            "partial_box_max_range",
         ):
             if not math.isfinite(float(self.cfg[name])) or self.cfg[name] <= 0:
                 raise ValueError(f"{name} must be positive and finite")
@@ -149,6 +206,10 @@ class SafeVisualFollow(Node):
             raise ValueError("max_control_lookahead must be >= control_lookahead")
         if self.cfg["fresh_timeout"] >= self.cfg["prediction_timeout"]:
             raise ValueError("fresh_timeout must be less than prediction_timeout")
+        if self.cfg["max_turn_standoff"] < self.cfg["stand_off"]:
+            raise ValueError("max_turn_standoff must be >= stand_off")
+        if self.cfg["partial_box_min_width"] >= 1:
+            raise ValueError("partial_box_min_width must be < one")
         if int(self.cfg["lock_frames"]) < 1:
             raise ValueError("lock_frames must be at least one")
         if not self.get_parameter("use_sim_time").value:
@@ -183,6 +244,10 @@ class SafeVisualFollow(Node):
         )
         self.create_subscription(
             Bool, "/tracker/balloon/burst", self.on_burst, event_qos
+        )
+        self.create_subscription(
+            Bool, "/tracker/drone/virtual_contact", self.on_virtual_contact,
+            event_qos,
         )
         self.create_subscription(
             VehicleLocalPosition,
@@ -238,7 +303,10 @@ class SafeVisualFollow(Node):
         self.camera_frame = None
         self.clock_bridge = Px4Clock(str(self.cfg["px4_timestamp_mode"]))
         self.history = PoseHistory()
-        self.estimator = TargetFilter(float(self.cfg["target_acceleration_noise"]))
+        self.estimator = TargetFilter(
+            float(self.cfg["target_acceleration_noise"]),
+            acceleration_limit=float(self.cfg["target_acceleration_limit"]),
+        )
         self.smoother = VelocitySmoother(
             float(self.cfg["command_acceleration"]), float(self.cfg["command_jerk"])
         )
@@ -252,6 +320,12 @@ class SafeVisualFollow(Node):
         self.yaw = 0.0
         self.target_takeoff_time = None
         self.burst_confirmed = False
+        self.virtual_contact_confirmed = False
+        self.near_started = None
+        self.near_target = None
+        self.near_direction = None
+        self.near_ignore_vision = False
+        self.reacquire_repeat = False
         self.state = "WAIT_TARGET"
         self.stream_start = None
         self.last_command = 0.0
@@ -260,6 +334,7 @@ class SafeVisualFollow(Node):
         self.last_frame_stamp = -1.0
         self.last_frame_detected = False
         self.last_valid_wall = 0.0
+        self.last_valid_delay = 0.0
         self.last_delay = math.nan
         self.pending_detection = None
         self.detection_streak = 0
@@ -281,6 +356,7 @@ class SafeVisualFollow(Node):
         self.last_target = None
         self.rejected_frames = 0
         self.accepted_frames = 0
+        self.bearing_frames = 0
         self.processed_frames = 0
         self.last_report_wall = time.monotonic()
         self.last_report_accepted = 0
@@ -373,8 +449,14 @@ class SafeVisualFollow(Node):
             self.target_takeoff_time = None
 
     def on_burst(self, msg):
-        if msg.data and self.state in self.ACTIVE and self.armed:
+        if (self.cfg["target_geometry"] == "sphere" and msg.data
+                and self.state in self.ACTIVE and self.armed):
             self.burst_confirmed = True
+
+    def on_virtual_contact(self, msg):
+        if (self.cfg["virtual_contact_mode"] and msg.data
+                and self.armed and self.state in self.ACTIVE):
+            self.virtual_contact_confirmed = True
 
     def reset_tracking(self):
         self.history.clear()
@@ -395,6 +477,12 @@ class SafeVisualFollow(Node):
         self.last_seen = None
         self.last_frame_detected = False
         self.last_target = None
+        self.last_valid_delay = 0.0
+        self.near_started = None
+        self.near_target = None
+        self.near_direction = None
+        self.near_ignore_vision = False
+        self.reacquire_repeat = False
         if self.position is not None:
             self.yaw = float(self.position.heading)
             self.reacquire_yaw = self.yaw
@@ -412,6 +500,8 @@ class SafeVisualFollow(Node):
         return wrap(float(direction_yaw) + wrap(body_yaw - camera_yaw))
 
     def on_detection(self, msg):
+        if self.state == "PREDICT_CONTACT" or self.near_ignore_vision:
+            return
         if seconds(msg.header.stamp) > self.last_frame_stamp:
             self.pending_detection = msg
 
@@ -453,6 +543,14 @@ class SafeVisualFollow(Node):
         self.last_frame_detected = False
         self.last_delay = max(0.0, age)
         values = [msg.center_x, msg.center_y, msg.width, msg.height, msg.confidence]
+        confidence_threshold = self.cfg["confidence_threshold"]
+        if (self.track_locked and self.estimator.stamp is not None
+                and stamp - self.estimator.stamp <= self.cfg["prediction_timeout"]
+                and np.isfinite(values).all()):
+            predicted = self.estimator.predict(stamp)
+            uv = None if predicted is None else self.camera.project(predicted[0][:3], pose)
+            if uv is not None and np.linalg.norm(uv - [msg.center_x, msg.center_y]) < 0.18:
+                confidence_threshold = self.cfg["tracking_confidence_threshold"]
         image_detection = (
             msg.detected
             and np.isfinite(values).all()
@@ -460,7 +558,7 @@ class SafeVisualFollow(Node):
             and 0 <= msg.center_y <= 1
             and 0 < msg.width <= 1
             and 0 < msg.height <= 1
-            and msg.confidence >= self.cfg["confidence_threshold"]
+            and msg.confidence >= confidence_threshold
         )
         observation = None
         if image_detection:
@@ -481,6 +579,38 @@ class SafeVisualFollow(Node):
                 R @ self.camera.body_from_camera @ np.array([1.0, 0.0, 0.0]),
                 bool(msg.clipped),
             )
+        if msg.clipped and image_detection and self.cfg["target_geometry"] == "drone":
+            # A partially visible airframe supplies a coarse bearing, whether
+            # it fills the view or is crossing an edge. Never trust its width
+            # for depth, and require association with an existing recent track.
+            if (self.estimator.stamp is not None
+                    and msg.width >= self.cfg["partial_box_min_width"]
+                    and stamp - self.estimator.stamp <= self.cfg["max_image_age"]):
+                predicted = self.estimator.predict(stamp)
+                if predicted is not None:
+                    prior, _ = predicted
+                    origin = pose.position + rotation(pose.q) @ self.camera.offset
+                    prior_range = float(np.linalg.norm(prior[:3] - origin))
+                    uv = self.camera.project(prior[:3], pose)
+                    if (prior_range <= self.cfg["partial_box_max_range"]
+                            and uv is not None
+                            and np.linalg.norm(uv - [msg.center_x, msg.center_y]) < 0.3):
+                        try:
+                            origin, direction = self.camera.bearing(
+                                (msg.center_x, msg.center_y), pose
+                            )
+                            accepted = self.estimator.update_bearing(stamp, origin, direction)
+                        except (ValueError, np.linalg.LinAlgError):
+                            accepted = False
+                        if accepted:
+                            self.last_seen = observation
+                            self.last_frame_detected = True
+                            self.last_valid_wall = time.monotonic()
+                            self.last_valid_delay = max(0.0, age)
+                            self.last_target = self.estimator.x[:3].copy()
+                            self.accepted_frames += 1
+                            self.bearing_frames += 1
+                            return
         if not image_detection or msg.clipped:
             # A clipped sphere has unreliable size/range, but its last image
             # bearing still tells us which side it exited. Only associate it
@@ -512,7 +642,8 @@ class SafeVisualFollow(Node):
             self.track_locked = False
         try:
             point, covariance = self.camera.observe(
-                values[:4], pose, float(self.cfg["target_width_m"])
+                values[:4], pose, float(self.cfg["target_width_m"]),
+                geometry=self.cfg["target_geometry"],
             )
             accepted = self.estimator.update(stamp, point, covariance)
         except (ValueError, np.linalg.LinAlgError):
@@ -526,6 +657,7 @@ class SafeVisualFollow(Node):
             self.track_locked = True
         self.last_frame_detected = True
         self.last_valid_wall = time.monotonic()
+        self.last_valid_delay = max(0.0, age)
         self.accepted_frames += 1
         self.last_target = point.copy()
         self.last_seen = observation
@@ -647,6 +779,82 @@ class SafeVisualFollow(Node):
         self.track_reason = "tracking"
         return result
 
+    def fresh_observation_age(self):
+        # Camera processing latency is already compensated by predict(now).
+        # A steady stream of 0.3 s delayed frames must not be mistaken for a
+        # dropout every control tick, which would prohibit all acceleration.
+        # The exposure-age expiry and covariance gate remain independent.
+        return min(
+            self.cfg["fresh_timeout"] + self.last_valid_delay,
+            self.cfg["prediction_timeout"] * 0.9,
+        )
+
+    def begin_near_prediction(self, now, pose, estimate):
+        """Freeze a fresh visual track before the target fills the camera view."""
+        if (not self.cfg["virtual_contact_mode"] or not self.track_locked
+                or not self.last_frame_detected or self.last_seen is None
+                or self.last_seen.clipped or self.estimator.stamp is None
+                or now - self.estimator.stamp > self.cfg["max_image_age"]):
+            return False
+        x, covariance = estimate
+        distance = float(np.linalg.norm(x[:3] - pose.position))
+        sigma = math.sqrt(max(0.0, float(np.linalg.eigvalsh(covariance[:3, :3])[-1])))
+        if (distance > self.cfg["near_prediction_distance"]
+                or sigma > self.cfg["near_prediction_max_sigma"]):
+            return False
+        self.near_target = x.copy()
+        relative = self.near_target[:3] - pose.position
+        self.near_direction = relative / max(float(np.linalg.norm(relative)), 1e-6)
+        speed = float(np.linalg.norm(self.near_target[3:]))
+        if speed > self.cfg["max_follow_speed"]:
+            self.near_target[3:] *= self.cfg["max_follow_speed"] / speed
+        self.near_started = now
+        self.near_ignore_vision = True
+        self.pending_detection = None
+        self.state = "PREDICT_CONTACT"
+        self.track_reason = "short-horizon prediction"
+        return True
+
+    def follow_near_prediction(self, pose, now, dt):
+        elapsed = max(0.0, now - self.near_started)
+        horizon = min(elapsed + 0.25, self.cfg["near_prediction_timeout"])
+        target_position = self.near_target[:3] + self.near_target[3:] * horizon
+        relative = target_position - pose.position
+        distance = float(np.linalg.norm(relative))
+        direction = relative / distance if distance > 1e-6 else self.near_direction
+        closing_speed = min(
+            self.cfg["near_prediction_speed"],
+            max(0.8, 1.8 * distance),
+        )
+        desired = self.near_target[3:] + closing_speed * direction
+        horizontal_speed = float(np.linalg.norm(desired[:2]))
+        speed_limit = float(self.cfg["near_prediction_speed"])
+        if horizontal_speed > speed_limit:
+            desired[:2] *= speed_limit / horizontal_speed
+        desired[2] = float(np.clip(
+            desired[2], -self.cfg["max_vertical_speed"], self.cfg["max_vertical_speed"]
+        ))
+        if np.linalg.norm(relative[:2]) > 0.05:
+            direction = math.atan2(float(relative[1]), float(relative[0]))
+            self.turn_towards(self.setpoint_yaw_for_direction(direction, pose), dt)
+        self.send_velocity(desired, dt)
+
+    def finish_near_prediction(self, pose):
+        """A missed virtual contact ends blind motion and starts a fresh scan."""
+        self.near_target = None
+        self.near_direction = None
+        self.near_ignore_vision = True
+        self.reacquire_repeat = True
+        self.pending_detection = None
+        self.estimator.clear()
+        self.track_locked = False
+        self.detection_streak = 0
+        self.last_seen = None
+        self.last_target = None
+        self.state = "BRAKING"
+        self.track_reason = "near prediction timed out"
+        self.smoother.reset(pose.velocity)
+
     def tick(self):
         wall = time.monotonic()
         now = self.sim_now()
@@ -683,7 +891,10 @@ class SafeVisualFollow(Node):
             self.yaw_smoother.reset(self.yaw)
         if self.stream_start is None:
             self.stream_start = wall
-        self.process_detection(now)
+        if self.state == "PREDICT_CONTACT" or self.near_ignore_vision:
+            self.pending_detection = None
+        else:
+            self.process_detection(now)
         pose = self.history.at(now)
         if self.state == "WAIT_TARGET":
             self.send_position(self.home)
@@ -700,8 +911,11 @@ class SafeVisualFollow(Node):
                     "Target airborne head start completed; requesting tracker takeoff."
                 )
             return
-        if self.burst_confirmed and self.armed:
+        if self.cfg["target_geometry"] == "sphere" and self.burst_confirmed and self.armed:
             self.request_land("simulator confirmed balloon contact")
+            return
+        if self.virtual_contact_confirmed and self.armed:
+            self.request_land("simulator confirmed virtual drone contact")
             return
         if self.state == "STARTING":
             self.send_position(
@@ -759,6 +973,11 @@ class SafeVisualFollow(Node):
             if wall - self.odom_wall > 2.0:
                 self.request_land("own time-aligned odometry unavailable (failsafe)")
             return
+        if self.state == "PREDICT_CONTACT":
+            if now - self.near_started < self.cfg["near_prediction_timeout"]:
+                self.follow_near_prediction(pose, now, dt)
+                return
+            self.finish_near_prediction(pose)
         estimate = self.track_available(now)
         # A visible edge exit is stronger evidence than a delayed camera frame.
         # React while the last bearing is still recent; the longer prediction
@@ -768,8 +987,8 @@ class SafeVisualFollow(Node):
             and self.last_seen is not None
             and self.last_seen.stamp >= self.estimator.stamp - 1e-6
             and (
-                self.last_seen.clipped
-                or now - self.estimator.stamp > self.cfg["fresh_timeout"]
+                (self.last_seen.clipped and not self.last_frame_detected)
+                or now - self.estimator.stamp > self.fresh_observation_age()
             )
             and edge_recovery_hint(
                 self.last_seen, pose, self.last_target,
@@ -787,6 +1006,9 @@ class SafeVisualFollow(Node):
                 self.yaw_smoother.reset(self.yaw)
             x, P = estimate
             distance = np.linalg.norm(x[:3] - pose.position)
+            if self.begin_near_prediction(now, pose, estimate):
+                self.follow_near_prediction(pose, now, dt)
+                return
             # Blend closure continuously while observations remain valid.
             blend = float(np.clip(
                 (distance - self.cfg["final_distance"])
@@ -805,10 +1027,11 @@ class SafeVisualFollow(Node):
             # On a gap, reduce closure continuously instead of switching PX4
             # straight into position hold and re-accelerating each frame.
             age = max(0.0, now - self.estimator.stamp)
-            coasting = age > self.cfg["fresh_timeout"]
+            fresh_age = self.fresh_observation_age()
+            coasting = age > fresh_age
             fade = float(np.clip(
                 (self.cfg["prediction_timeout"] - age)
-                / (self.cfg["prediction_timeout"] - self.cfg["fresh_timeout"]),
+                / (self.cfg["prediction_timeout"] - fresh_age),
                 0.0, 1.0,
             ))
             fade = fade * fade * (3.0 - 2.0 * fade)
@@ -819,10 +1042,22 @@ class SafeVisualFollow(Node):
                 P,
                 float(closure) * fade,
                 float(self.cfg["control_lookahead"]),
+                stand_off=float(self.cfg["stand_off"]),
+                braking_acceleration=float(self.cfg["braking_deceleration"]),
+                braking_latency=float(self.cfg["braking_latency"]),
+                max_retreat_speed=float(self.cfg["max_retreat_speed"]),
                 max_speed=float(self.cfg["max_follow_speed"]),
                 max_vertical=float(self.cfg["max_vertical_speed"]),
                 max_lookahead=float(self.cfg["max_control_lookahead"]),
                 prediction_weight=fade,
+                target_acceleration=self.estimator.acceleration * fade,
+                prediction_yaw_weight=float(self.cfg["prediction_yaw_weight"]),
+                yaw_prediction_time=float(self.cfg["yaw_prediction_time"]),
+                navigation_gain=float(self.cfg["navigation_gain"]),
+                turn_rate_budget=float(self.cfg["turn_rate_budget"]),
+                max_turn_standoff=float(self.cfg["max_turn_standoff"]),
+                image_box_width=(self.last_seen.width if self.last_seen is not None
+                                 and self.cfg["target_geometry"] == "drone" else None),
             )
             if coasting:
                 # Use the predicted bearing to steer without asking for more
@@ -838,6 +1073,7 @@ class SafeVisualFollow(Node):
             self.reacquire_started = None
             self.reacquire_scan_started = None
             self.reacquire_position = None
+            self.reacquire_repeat = False
             self.recovery_position = None
             return
         if self.state == "SEARCH":
@@ -951,7 +1187,7 @@ class SafeVisualFollow(Node):
                 configured_rate = self.cfg["search_yaw_rate" if searching else "reacquire_yaw_rate"]
                 rate = min(configured_rate, self.cfg["yaw_rate_limit"])
                 progress += rate * dt
-                if searching:
+                if searching or self.reacquire_repeat:
                     progress %= 2 * math.pi
                 else:
                     progress = min(2 * math.pi, progress)
@@ -959,6 +1195,8 @@ class SafeVisualFollow(Node):
             self.search_scan_started, self.search_progress = started, progress
         else:
             self.reacquire_scan_started, self.reacquire_progress = started, progress
+            if started is not None:
+                self.near_ignore_vision = False
         self.turn_towards(wrap(start_yaw + progress), dt)
         self.send_position(anchor, self.yaw_smoother.rate)
 

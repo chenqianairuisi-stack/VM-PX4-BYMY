@@ -5,6 +5,10 @@ set -eo pipefail
 # owns the detector, tracker, and target keyboard processes.
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONNOUSERSITE=1
+export FOLLOW_MODE="${FOLLOW_MODE:-drone}"
+if [[ "$FOLLOW_MODE" == drone || "$FOLLOW_MODE" == virtual_contact ]]; then
+  "$REPO_DIR/scripts/yolo_detector.sh" --check
+fi
 source /opt/ros/humble/setup.bash
 source "$REPO_DIR/install/local_setup.bash"
 
@@ -51,7 +55,11 @@ sleep 8
 check_children
 
 start_child "$REPO_DIR/runtime/dual/camera.log" "$REPO_DIR/scripts/dual_camera.sh"
-start_child "$REPO_DIR/runtime/dual/detector.log" "$REPO_DIR/scripts/red_detector.sh"
+if [[ "$FOLLOW_MODE" == drone || "$FOLLOW_MODE" == virtual_contact ]]; then
+  start_child "$REPO_DIR/runtime/dual/detector.log" "$REPO_DIR/scripts/yolo_detector.sh"
+else
+  start_child "$REPO_DIR/runtime/dual/detector.log" "$REPO_DIR/scripts/red_detector.sh"
+fi
 start_child "$REPO_DIR/runtime/dual/follow.log" "$REPO_DIR/scripts/follow.sh"
 sleep 2
 check_children

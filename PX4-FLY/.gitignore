@@ -5,3 +5,7 @@ runtime/
 __pycache__/
 *.pyc
 runtime/**/*.ulg
+.venv*/
+weights/*.pt
+weights/*.onnx
+weights/metrics.json

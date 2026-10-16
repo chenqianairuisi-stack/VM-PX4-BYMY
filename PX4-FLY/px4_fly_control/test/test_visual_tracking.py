@@ -286,3 +286,206 @@ def test_last_camera_edge_sets_bounded_recovery_side_and_yaw():
         np.array([0, 1, 0]), False,
     )
     assert edge_recovery_hint(middle, own, [1.0, 0, 0]) is None
+
+
+def test_drone_range_uses_span_not_thin_body_height():
+    camera = CameraGeometry()
+    width = camera.fx * .60 / 5.0 / camera.width
+    a, cov = camera.observe([.5,.5,width,.012], pose(), .60, geometry='drone')
+    b, _ = camera.observe([.5,.5,width,.04], pose(), .60, geometry='drone')
+    np.testing.assert_allclose(a, [5.21,0,-.02])
+    np.testing.assert_allclose(a, b)
+    assert cov[0,0] >= 1.25**2
+
+
+def test_drone_standoff_closes_holds_and_retreats():
+    camera = CameraGeometry()
+    commands = []
+    for distance in [6,4,2]:
+        target = np.r_[camera.offset + [distance,0,0], [0,0,0]]
+        command, _, _, visible = tracking_command(camera, pose(), target, np.eye(6)*.001,
+                                                  1.5, .12, stand_off=4)
+        assert visible
+        commands.append(command)
+    assert commands[0][0] > 0
+    np.testing.assert_allclose(commands[1], [0,0,0], atol=1e-10)
+    assert -1.0 <= commands[2][0] < 0
+
+
+def test_drone_standoff_tracks_target_velocity_at_desired_range():
+    camera = CameraGeometry()
+    # At 1 m/s the safe moving separation is 4 m plus stopping/latency room.
+    target = np.r_[camera.offset + [4.5,0,0], [1,0,0]]
+    command, _, _, _ = tracking_command(camera, pose(velocity=(1,0,0)), target,
+                                        np.eye(6)*.001, 1.5, .12, stand_off=4)
+    np.testing.assert_allclose(command, [1,0,0], atol=1e-10)
+
+
+def test_drone_brakes_early_when_relative_speed_is_high():
+    camera = CameraGeometry()
+    point = camera.offset + [6.0, 0.0, 0.0]
+    target = np.r_[point, [0.0, 0.0, 0.0]]
+    standing, _, _, _ = tracking_command(
+        camera, pose(), target, np.eye(6) * .001, 2.8, .12,
+        stand_off=4.0, braking_acceleration=2.2, braking_latency=.25,
+    )
+    closing, _, _, _ = tracking_command(
+        camera, pose(velocity=(2.0, 0.0, 0.0)), target, np.eye(6) * .001,
+        2.8, .12, stand_off=4.0, braking_acceleration=2.2,
+        braking_latency=.25,
+    )
+    # At 2 m/s, stopping needs about 1.4 m. Begin decelerating while still
+    # outside the 4 m stand-off; do not wait for a range threshold crossing.
+    assert standing[0] > 1.5
+    assert 0 < closing[0] < standing[0] * .5
+
+
+def test_braking_preserves_room_for_moving_target_to_stop():
+    camera = CameraGeometry()
+    point = camera.offset + [6.0, 0.0, 0.0]
+    state = np.r_[point, [2.0, 0.0, 0.0]]
+    nearby, _, _, _ = tracking_command(
+        camera, pose(velocity=(2.0,0,0)), state, np.eye(6)*.001,
+        2.8, .12, stand_off=4.0, braking_acceleration=1.2,
+    )
+    far = state.copy()
+    far[0] += 4
+    distant, _, _, _ = tracking_command(
+        camera, pose(velocity=(2.0,0,0)), far, np.eye(6)*.001,
+        2.8, .12, stand_off=4.0, braking_acceleration=1.2,
+    )
+    assert nearby[0] < 2.0  # Open a stopping gap even at matched speed.
+    assert distant[0] > 2.0  # Keep pursuing while there is room to stop.
+
+
+def test_acceleration_observer_is_bounded_and_prediction_does_not_mutate_filter():
+    tracker = TargetFilter(acceleration_limit=3.5)
+    for stamp in np.arange(1.0, 4.0, 0.05):
+        t = stamp - 1.0
+        assert tracker.update(float(stamp), [6.0, 0.5 * t * t, 0], np.eye(3) * 0.0025)
+    assert 0.3 < tracker.acceleration[1] <= 3.5
+    state = tracker.x.copy()
+    future, covariance = tracker.predict(tracker.stamp + 0.4)
+    np.testing.assert_allclose(future[:3], state[:3] + state[3:] * .4)
+    assert np.linalg.norm(tracker.acceleration) <= 3.5
+    np.testing.assert_array_equal(tracker.x, state)
+    assert np.linalg.eigvalsh(covariance).min() > 0
+    tracker.clear()
+    np.testing.assert_array_equal(tracker.acceleration, [0, 0, 0])
+
+
+def test_acceleration_leads_a_turn_without_amplifying_depth_noise():
+    camera = CameraGeometry()
+    target = np.r_[camera.offset + [6, 0, 0], [0, 0, 0]]
+    options = dict(stand_off=6, prediction_yaw_weight=.8, yaw_prediction_time=.4)
+    baseline, _, _, _ = tracking_command(camera, pose(), target, np.eye(6)*.001,
+                                         2.8, .12, **options)
+    radial, radial_yaw, _, _ = tracking_command(
+        camera, pose(), target, np.eye(6)*.001, 2.8, .12,
+        target_acceleration=[3.5, 0, 0], **options,
+    )
+    np.testing.assert_allclose(radial, baseline)
+    assert abs(radial_yaw) < 1e-12
+    lateral, yaw, _, _ = tracking_command(
+        camera, pose(), target, np.eye(6)*.001, 2.8, .12,
+        target_acceleration=[0, 2, 0], **options,
+    )
+    assert lateral[1] > .2 and yaw > 0
+
+
+def test_bearing_only_update_does_not_invent_depth_from_a_clipped_box():
+    tracker = TargetFilter()
+    assert not tracker.update_bearing(1, [0, 0, 0], [1, 0, 0])
+    tracker.update(1, [1.5, 0, 0], np.diag([1.0, 0.1, 0.1]))
+    prior, prior_covariance = tracker.predict(1.1)
+    assert tracker.update_bearing(1.1, [0, 0, 0], [1, 0, 0])
+    np.testing.assert_allclose(tracker.x, prior)
+    assert abs(tracker.P[0, 0] - prior_covariance[0, 0]) < 1e-12
+    assert tracker.P[1, 1] < prior_covariance[1, 1]
+    assert not tracker.update_bearing(1.1, [0, 0, 0], [1, 0, 0])
+
+
+def test_predictive_heading_leads_a_lateral_crossing_but_not_matched_motion():
+    camera = CameraGeometry()
+    target = np.r_[camera.offset + [6, 0, 0], [0, 3, 0]]
+    options = dict(stand_off=6, prediction_yaw_weight=.8, yaw_prediction_time=.4)
+    _, yaw, _, _ = tracking_command(camera, pose(), target, np.eye(6)*.001,
+                                     2.8, .12, **options)
+    assert .1 < yaw < .3
+    _, matched_yaw, _, _ = tracking_command(
+        camera, pose(velocity=(0, 3, 0)), target, np.eye(6)*.001, 2.8, .12, **options
+    )
+    assert abs(matched_yaw) < 1e-12
+    near = target.copy()
+    near[:3] = camera.offset + [.5, 0, 0]
+    _, near_yaw, _, _ = tracking_command(camera, pose(), near, np.eye(6)*.001,
+                                        2.8, .12, **options)
+    assert 0 < near_yaw <= .36 + 1e-12  # Bounded lead even when v_perp/r is huge.
+
+
+def test_lateral_turn_budget_opens_range_before_high_rate_yaw_is_required():
+    camera = CameraGeometry()
+    target = np.r_[camera.offset + [6, 0, 0], [0, 3, 0]]
+    ordinary, _, _, _ = tracking_command(camera, pose(), target, np.eye(6)*.001,
+                                          2.8, .12, stand_off=6)
+    predictive, _, _, _ = tracking_command(
+        camera, pose(), target, np.eye(6)*.001, 2.8, .12, stand_off=6,
+        turn_rate_budget=.35, max_turn_standoff=10,
+    )
+    assert abs(ordinary[0]) < 1e-12
+    assert predictive[0] < -.5
+    assert predictive[1] > 2.0  # Match lateral motion while opening distance.
+
+
+def test_oversized_box_suppresses_closure_without_disabling_retreat():
+    camera = CameraGeometry()
+    target = np.r_[camera.offset + [8, 0, 0], [0, 0, 0]]
+    normal, _, _, _ = tracking_command(camera, pose(), target, np.eye(6)*.001,
+                                       2.8, .12, stand_off=6)
+    large, _, _, _ = tracking_command(camera, pose(), target, np.eye(6)*.001,
+                                      2.8, .12, stand_off=6, image_box_width=.96)
+    assert 0 <= large[0] < normal[0] * .3
+    target[:3] = camera.offset + [2, 0, 0]
+    retreat, _, scale, _ = tracking_command(camera, pose(), target, np.eye(6)*.001,
+                                            2.8, .12, stand_off=6, image_box_width=.96)
+    assert retreat[0] < -.2 and scale >= .6
+
+
+def test_stopping_envelope_caps_total_forward_feedforward():
+    camera = CameraGeometry()
+    for distance in (3., 6., 8., 12.):
+        target = np.r_[camera.offset + [distance, 0, 0], [4., 0, 0]]
+        command, _, _, _ = tracking_command(
+            camera, pose(), target, np.eye(6)*.001, 2.8, .12,
+            stand_off=6, braking_acceleration=1.2, braking_latency=.55,
+            max_retreat_speed=2.8,
+        )
+        forward = max(0., command[0])
+        assert forward*.55 + forward**2/(2*1.2) <= max(0., distance-6) + 1e-9
+
+
+def test_bounded_navigation_uses_los_rate_only_during_safe_closure():
+    camera = CameraGeometry()
+    target = np.r_[camera.offset + [12, 0, 0], [0, 3, 0]]
+    options = dict(stand_off=6, max_speed=5, braking_acceleration=1.2)
+    weak, _, _, _ = tracking_command(
+        camera, pose(velocity=(2, 0, 0)), target, np.eye(6)*.001,
+        2.8, .12, navigation_gain=.5, **options,
+    )
+    strong, _, _, _ = tracking_command(
+        camera, pose(velocity=(2, 0, 0)), target, np.eye(6)*.001,
+        2.8, .12, navigation_gain=2.0, **options,
+    )
+    assert strong[1] > weak[1]
+    assert strong[1] - weak[1] < 1.75
+    near = target.copy()
+    near[:3] = camera.offset + [3, 0, 0]
+    retreat_plain, _, _, _ = tracking_command(
+        camera, pose(), near, np.eye(6)*.001, 2.8, .12,
+        navigation_gain=0, max_retreat_speed=2.8, **options,
+    )
+    retreat_png, _, _, _ = tracking_command(
+        camera, pose(), near, np.eye(6)*.001, 2.8, .12,
+        navigation_gain=2, max_retreat_speed=2.8, **options,
+    )
+    np.testing.assert_allclose(retreat_png, retreat_plain)

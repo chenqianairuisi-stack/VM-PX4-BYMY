@@ -243,7 +243,7 @@ def test_keyboard_yaw_keys_publish_a_ramp_and_freeze_with_sim_clock():
             assert publish.call_args.args[0].yaw == first.yaw
         for _ in range(50):
             n.handle_key('w')
-        assert math.hypot(*n.target[:2]) <= 2.0 + 1e-9
+        assert math.hypot(*n.target[:2]) <= n.get_parameter('manual_lead_limit').value + 1e-9
     finally:
         n.destroy_node()
         rclpy.shutdown()
@@ -596,3 +596,301 @@ def test_target_balloon_is_visual_only_and_cannot_strike_ground():
     assert model.find("link[@name='tracking_balloon']") is None
     assert not any("balloon" in c.attrib["name"] or "tether" in c.attrib["name"]
                    for c in model.iter("collision"))
+
+
+def test_drone_mode_ignores_balloon_contact(controller):
+    n = controller
+    prepare_flying(n)
+    n.cfg['target_geometry'] = 'drone'
+    n.cfg['stand_off'] = 4.0
+    message = Bool()
+    message.data = True
+    n.on_burst(message)
+    assert not n.burst_confirmed
+
+
+def test_virtual_contact_accepts_event_while_active_in_virtual_mode(controller):
+    n = controller
+    prepare_flying(n)
+    n.cfg['target_geometry'] = 'drone'
+    n.cfg['stand_off'] = 3.0
+    event = Bool(data=True)
+    n.on_virtual_contact(event)
+    assert not n.virtual_contact_confirmed
+    n.cfg['virtual_contact_mode'] = True
+    n.on_virtual_contact(event)
+    assert n.virtual_contact_confirmed  # Gazebo confirms distance even without pixels.
+    n.virtual_contact_confirmed = False
+    n.track_locked = True
+    n.estimator.update(9.0, [4, 0, 0], np.eye(3)*.1)
+    n.on_virtual_contact(event)
+    assert n.virtual_contact_confirmed
+    n.virtual_contact_confirmed = False
+    n.estimator.clear()
+    n.estimator.update(10.1, [4, 0, 0], np.eye(3)*.1)
+    n.on_virtual_contact(Bool(data=False))
+    assert not n.virtual_contact_confirmed
+    n.on_virtual_contact(event)
+    assert n.virtual_contact_confirmed
+    with patch.object(n, 'request_land') as land:
+        n.tick()
+    land.assert_called_once_with('simulator confirmed virtual drone contact')
+
+
+def test_drone_mode_passes_standoff_to_guidance(controller):
+    n = controller
+    prepare_flying(n)
+    n.cfg['target_geometry'] = 'drone'
+    n.cfg['stand_off'] = 4.0
+    assert n.estimator.update(10.2, [4.21,0,-.02], np.eye(3)*.001)
+    n.last_valid_wall = time.monotonic()
+    n.track_locked = True
+    with patch.object(n.setpoint_pub, 'publish') as publish:
+        n.tick()
+    np.testing.assert_allclose(publish.call_args.args[0].velocity, [0,0,0], atol=1e-8)
+
+
+def prepare_near_contact(n):
+    prepare_flying(n)
+    n.cfg.update(target_geometry='drone', virtual_contact_mode=True,
+                 stand_off=0.0, virtual_contact_threshold=.5,
+                 near_prediction_distance=1.6)
+    n.estimator.update(10.2, [1.4, 0, 0], np.eye(3)*.001)
+    n.track_locked = n.last_frame_detected = True
+    n.last_valid_wall = time.monotonic()
+    n.last_seen = ExitObservation(10.2, .5, .5, .2, .2, 0., 0.,
+                                  np.array([0., 1., 0.]), False)
+    n.history.at = lambda _: n.history.samples[-1]
+
+
+@pytest.mark.parametrize('distance', [.3, .5, 1.0, 2.0])
+def test_virtual_contact_has_no_standoff_retreat_or_braking_radius(controller, distance):
+    n = controller
+    prepare_near_contact(n)
+    n.track_locked = False  # Exercise visual approach before prediction entry.
+    own = n.history.samples[-1]
+    own.velocity[0] = 2.0  # Positive stand_off would reserve braking distance.
+    n.estimator.x[:3] = [distance + n.camera.offset[0], 0, n.camera.offset[2]]
+    with patch.object(n, 'send_velocity') as send:
+        n.tick()
+    assert send.call_args.args[0][0] > 0
+
+
+def test_near_contact_freezes_visual_track_and_accepts_event_without_fresh_pixels(controller):
+    n = controller
+    prepare_near_contact(n)
+    with patch.object(n.setpoint_pub, 'publish'):
+        n.tick()
+        assert n.state == 'PREDICT_CONTACT'
+        snapshot = n.near_target.copy()
+        n.sim_now = lambda: 11.0
+        n.on_detection(detection(11.0))
+        n.tick()
+    assert n.pending_detection is None
+    assert n.estimator.stamp == pytest.approx(10.2)
+    np.testing.assert_array_equal(n.near_target, snapshot)
+    n.on_virtual_contact(Bool(data=True))
+    assert n.virtual_contact_confirmed
+    with patch.object(n, 'request_land') as land:
+        n.tick()
+    land.assert_called_once_with('simulator confirmed virtual drone contact')
+
+
+def test_near_contact_timeout_brakes_then_repeats_scan_with_vision_restored(controller):
+    n = controller
+    prepare_near_contact(n)
+    own = n.history.samples[-1]
+    with patch.object(n.setpoint_pub, 'publish') as publish:
+        n.tick()
+        own.velocity[0] = 1.0
+        n.sim_now = lambda: 11.71
+        n.tick()
+        assert n.state == 'BRAKING'
+        assert n.estimator.stamp is None and not n.track_locked
+        n.on_detection(detection(11.71))
+        assert n.pending_detection is None
+        own.velocity[:] = 0
+        n.sim_now = lambda: 11.73
+        n.tick()
+        assert n.state == 'REACQUIRE' and not n.near_ignore_vision
+        anchor = n.reacquire_position.copy()
+        traveled, previous = 0.0, 0.0
+        for i in range(1, 900):
+            n.sim_now = lambda i=i: 11.73 + i*.02
+            n.tick()
+            msg = publish.call_args.args[0]
+            np.testing.assert_allclose(msg.position, anchor)
+            traveled += wrap(msg.yaw-previous)
+            previous = msg.yaw
+            own.q = np.array([math.cos(msg.yaw/2), 0., 0., math.sin(msg.yaw/2)])
+        assert traveled > 2*math.pi
+        assert n.state == 'REACQUIRE'
+        n.on_detection(detection(n.sim_now()))
+        assert n.pending_detection is not None
+    n.on_virtual_contact(Bool(data=True))
+    assert n.virtual_contact_confirmed  # A real near pass during search also lands.
+
+
+@pytest.mark.parametrize('invalid', ['clipped', 'stale', 'uncertain', 'unlocked'])
+def test_near_prediction_requires_reliable_entry_track(controller, invalid):
+    n = controller
+    prepare_near_contact(n)
+    if invalid == 'clipped':
+        n.last_seen = SimpleNamespace(clipped=True)
+    elif invalid == 'stale':
+        n.estimator.stamp = 9.0
+    elif invalid == 'uncertain':
+        n.estimator.P[:3, :3] = np.eye(3)*4.0
+    else:
+        n.track_locked = False
+    assert not n.begin_near_prediction(10.2, n.history.samples[-1],
+                                      (n.estimator.x, n.estimator.P))
+
+
+def test_near_prediction_advances_frozen_target_velocity_and_limits_command(controller):
+    n = controller
+    prepare_near_contact(n)
+    n.estimator.x[4] = 1.0
+    assert n.begin_near_prediction(10.2, n.history.samples[-1],
+                                   (n.estimator.x, n.estimator.P))
+    with patch.object(n, 'send_velocity') as send:
+        n.follow_near_prediction(n.history.samples[-1], 10.8, .02)
+    desired = send.call_args.args[0]
+    assert desired[0] > 0 and desired[1] > 1.0
+    assert np.linalg.norm(desired[:2]) <= n.cfg['near_prediction_speed'] + 1e-9
+
+
+def test_near_prediction_keeps_closing_inside_half_metre_until_event(controller):
+    n = controller
+    prepare_near_contact(n)
+    n.estimator.x[:3] = [.3, 0, 0]
+    assert n.begin_near_prediction(10.2, n.history.samples[-1],
+                                   (n.estimator.x, n.estimator.P))
+    with patch.object(n, 'send_velocity') as send:
+        n.follow_near_prediction(n.history.samples[-1], 10.3, .02)
+    assert send.call_args.args[0][0] >= .8
+
+
+@pytest.mark.parametrize('filename', ['drone_follow.yaml', 'drone_virtual_contact.yaml'])
+def test_checked_in_drone_configs_start_controller(filename):
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[2]/'config'/filename
+    rclpy.init(args=['--ros-args', '--params-file', str(path)])
+    node = None
+    try:
+        node = SafeVisualFollow()
+        assert node.cfg['target_geometry'] == 'drone'
+        if node.cfg['virtual_contact_mode']:
+            assert node.cfg['virtual_contact_threshold'] == .5
+            assert node.cfg['stand_off'] == 0.0
+            assert node.cfg['near_prediction_distance'] > .5
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_detector_accepts_numpy_box_and_publishes_clipped_flag():
+    from px4_fly_control.detector_base import LatestFrameDetector
+    rclpy.init()
+    node = LatestFrameDetector('numpy_box_test')
+    try:
+        node.detect = lambda frame: tuple(np.float64(v) for v in [.95,.5,.1,.1,.9])
+        node.on_image(node.bridge.cv2_to_imgmsg(np.zeros((360,480,3),np.uint8),'bgr8'))
+        with patch.object(node.pub,'publish') as publish:
+            node.process_latest()
+        message = publish.call_args.args[0]
+        assert message.detected and message.clipped
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_drone_large_clipped_box_updates_bearing_without_triggering_edge_recovery(controller):
+    n = controller
+    prepare_flying(n)
+    n.cfg['target_geometry'] = 'drone'
+    n.cfg['stand_off'] = 6.0
+    n.track_locked = True
+    n.estimator.update(10.1, [1.21, .25, -.02], np.eye(3)*.1)
+    m = detection(10.2)
+    m.width, m.height, m.center_x, m.clipped = .6, .2, .72, True
+    n.on_detection(m)
+    with patch.object(n.setpoint_pub, 'publish') as publish:
+        n.tick()
+    assert n.estimator.stamp == pytest.approx(10.2)
+    assert n.last_seen.clipped and n.last_frame_detected
+    assert n.state == 'FINAL'
+    assert all(math.isnan(v) for v in publish.call_args.args[0].position)
+
+
+def test_clipped_box_cannot_initialise_a_drone_track(controller):
+    n = controller
+    n.cfg['target_geometry'] = 'drone'
+    m = detection(10.2)
+    m.width, m.clipped = .8, True
+    n.on_detection(m)
+    n.process_detection(10.2)
+    assert n.estimator.stamp is None
+    assert not n.track_locked
+
+
+def test_drone_partial_edge_frame_keeps_a_recent_associated_track(controller):
+    n = controller
+    n.cfg['target_geometry'] = 'drone'
+    n.estimator.update(10.1, [4, -2.8, -.02], np.eye(3)*.1)
+    m = detection(10.2)
+    m.center_x, m.width, m.clipped = .06, .12, True
+    n.on_detection(m)
+    n.process_detection(10.2)
+    assert n.estimator.stamp == pytest.approx(10.2)
+    assert n.bearing_frames == 1
+    assert n.last_frame_detected
+
+
+def test_steady_delayed_frames_are_predicted_instead_of_treated_as_dropout(controller):
+    n = controller
+    prepare_flying(n)
+    n.state = 'SEARCH'
+    n.history.at = lambda stamp: Pose(
+        stamp, np.zeros(3), np.zeros(3), np.array([1., 0, 0, 0]), np.zeros(3)
+    )
+    with patch.object(n.setpoint_pub, 'publish'):
+        for i in range(100):
+            now = 10.5 + i * .02
+            n.sim_now = lambda now=now: now
+            if i % 10 == 0:
+                n.on_detection(detection(now - .28))
+            n.tick()
+        assert n.track_locked
+        assert n.last_valid_delay == pytest.approx(.28)
+        assert n.smoother.velocity[0] > 2.0
+        n.sim_now = lambda: now + .9
+        n.tick()
+        assert n.state in ('BRAKING', 'REACQUIRE')
+
+
+def test_low_score_detection_requires_locked_track_and_prediction_association(controller):
+    n = controller
+    n.cfg['tracking_confidence_threshold'] = .35
+    low = detection(10.0)
+    low.confidence = .4
+    n.on_detection(low)
+    n.process_detection(10.0)
+    assert n.estimator.stamp is None
+    n.on_detection(detection(10.1))
+    n.process_detection(10.1)
+    n.track_locked = True
+    low = detection(10.2)
+    low.confidence = .4
+    n.on_detection(low)
+    n.process_detection(10.2)
+    assert n.estimator.stamp == pytest.approx(10.2)
+    n.history.at = lambda stamp: Pose(
+        stamp, np.zeros(3), np.zeros(3), np.array([1., 0, 0, 0]), np.zeros(3)
+    )
+    unrelated = detection(10.3)
+    unrelated.confidence, unrelated.center_x = .4, .85
+    n.on_detection(unrelated)
+    n.process_detection(10.3)
+    assert n.estimator.stamp == pytest.approx(10.2)

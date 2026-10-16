@@ -19,6 +19,10 @@ if [[ ! -f "$REPO_DIR/install/px4_fly_sim/lib/libballoon_contact.so" ]]; then
   echo 'Build the project first: ./scripts/build.sh' >&2
   exit 1
 fi
+if [[ "${FOLLOW_MODE:-drone}" == virtual_contact && ! -f "$REPO_DIR/install/px4_fly_sim/lib/libvirtual_contact.so" ]]; then
+  echo 'Build the virtual contact evaluator first: ./scripts/build.sh' >&2
+  exit 1
+fi
 source "$REPO_DIR/install/local_setup.bash"
 source "$PX4_DIR/Tools/simulation/gazebo-classic/setup_gazebo.bash" "$PX4_DIR" "$PX4_BUILD"
 export GAZEBO_MODEL_PATH="$REPO_DIR/models:${GAZEBO_MODEL_PATH:-}"
@@ -29,6 +33,11 @@ export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
 export PX4_SIM_MODEL=gazebo-classic_iris
 export PX4_SIM_WORLD=dual_uav
 mkdir -p "$REPO_DIR/runtime/dual/target" "$REPO_DIR/runtime/dual/tracker"
+WORLD="$REPO_DIR/worlds/dual_uav.world"
+if [[ "${FOLLOW_MODE:-drone}" == drone || "${FOLLOW_MODE:-drone}" == virtual_contact ]]; then
+  WORLD="$REPO_DIR/runtime/dual/drone.world"
+  python3 "$REPO_DIR/scripts/prepare_drone_world.py" "$WORLD" "${FOLLOW_MODE:-drone}"
+fi
 
 pids=()
 cleanup() {
@@ -55,7 +64,7 @@ trap 'exit 130' INT TERM
 
 MicroXRCEAgent udp4 -p 8888 >"$REPO_DIR/runtime/dual/agent.log" 2>&1 &
 pids+=("$!")
-gzserver "$REPO_DIR/worlds/dual_uav.world" -s libgazebo_ros_init.so -s libgazebo_ros_factory.so \
+gzserver "$WORLD" -s libgazebo_ros_init.so -s libgazebo_ros_factory.so \
   --ros-args --params-file "$REPO_DIR/config/gazebo.yaml" \
   >"$REPO_DIR/runtime/dual/gazebo.log" 2>&1 &
 pids+=("$!")

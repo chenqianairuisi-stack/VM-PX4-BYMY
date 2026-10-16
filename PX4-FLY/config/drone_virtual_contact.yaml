@@ -1,0 +1,32 @@
+safe_visual_follow:
+  ros__parameters:
+    target_geometry: drone
+    target_width_m: 0.60
+    virtual_contact_mode: true
+    virtual_contact_threshold: 0.5
+    stand_off: 0.0
+    approach_speed: 2.8
+    final_speed: 1.2
+    lock_speed: 0.8
+    final_distance: 2.2
+    near_prediction_distance: 1.6
+    near_prediction_timeout: 1.5
+    near_prediction_speed: 2.0
+    near_prediction_max_sigma: 0.6
+    max_follow_speed: 5.0
+    command_acceleration: 3.0
+    command_jerk: 6.0
+    braking_latency: 0.40
+    braking_deceleration: 2.5
+    max_retreat_speed: 2.8
+    target_acceleration_limit: 3.5
+    prediction_yaw_weight: 0.80
+    yaw_prediction_time: 0.40
+    navigation_gain: 2.0
+    turn_rate_budget: 0.0
+    max_turn_standoff: 10.0
+    partial_box_min_width: 0.03
+    partial_box_max_range: 12.0
+    confidence_threshold: 0.55
+    tracking_confidence_threshold: 0.35
+    lock_frames: 3

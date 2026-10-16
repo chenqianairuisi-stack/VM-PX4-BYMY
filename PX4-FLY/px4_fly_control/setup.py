@@ -23,5 +23,5 @@ setup(
             'yolo_detector = px4_fly_control.yolo_detector:main',
             'red_color_detector = px4_fly_control.red_color_detector:main',
         ],
-    },
+    }
 )

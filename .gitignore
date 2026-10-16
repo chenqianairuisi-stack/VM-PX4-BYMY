@@ -1,0 +1,10 @@
+drone_training/dataset/images/
+drone_training/dataset/labels/
+drone_training/dataset/data.local.yaml
+drone_training/dataset/*.cache
+drone_training/runs/
+drone_training/*.log
+drone_training/*.pt
+drone_training/trained_model/*.pt
+drone_training/trained_model/*.onnx
+drone_training/trained_model/*.jpg

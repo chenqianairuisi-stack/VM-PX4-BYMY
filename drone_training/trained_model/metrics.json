@@ -1,0 +1,16 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "epochs_requested": 100,
+  "test_metrics": {
+    "metrics/precision(B)": 0.9994153353908972,
+    "metrics/recall(B)": 1.0,
+    "metrics/mAP50(B)": 0.995,
+    "metrics/mAP50-95(B)": 0.8072198481480379,
+    "fitness": 0.8072198481480379
+  },
+  "train_directory": "C:\\Users\\\u9648\u6f5c\\Desktop\\VM-PX4-BYMY\\drone_training\\runs\\drone",
+  "classes": {
+    "0": "drone"
+  },
+  "status": "training_complete_requires_simulation_validation"
+}

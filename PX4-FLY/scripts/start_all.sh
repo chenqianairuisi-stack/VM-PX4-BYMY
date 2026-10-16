@@ -3,6 +3,10 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONNOUSERSITE=1
+export FOLLOW_MODE="${FOLLOW_MODE:-drone}"
+if [[ "$FOLLOW_MODE" == drone || "$FOLLOW_MODE" == virtual_contact ]]; then
+  "$REPO_DIR/scripts/yolo_detector.sh" --check
+fi
 
 if [[ "${1:-}" == "--single-terminal" ]]; then
   exec "$REPO_DIR/scripts/start_single_terminal.sh"
@@ -30,14 +34,20 @@ fi
 launch() {
   local title="$1"
   local command="$2"
-  gnome-terminal --title="$title" -- bash -lc "$command"
+  gnome-terminal --title="$title" -- env FOLLOW_MODE="$FOLLOW_MODE" \
+    YOLO_MODEL="${YOLO_MODEL:-$REPO_DIR/weights/drone.onnx}" \
+    YOLO_PYTHON="${YOLO_PYTHON:-$REPO_DIR/.venv-yolo/bin/python}" bash -lc "$command"
 }
 
 launch 'PX4-FLY Gazebo 上帝视角' "$SIM_COMMAND"
 sleep 8
 launch 'PX4-FLY 目标机键盘' "cd '$REPO_DIR' && ./scripts/dual_keyboard.sh"
 launch 'PX4-FLY 追踪机第一视角' "cd '$REPO_DIR' && ./scripts/dual_camera.sh"
-launch 'PX4-FLY 红气球识别' "cd '$REPO_DIR' && ./scripts/red_detector.sh"
+if [[ "$FOLLOW_MODE" == drone || "$FOLLOW_MODE" == virtual_contact ]]; then
+  launch 'PX4-FLY YOLO 无人机识别' "cd '$REPO_DIR' && ./scripts/yolo_detector.sh"
+else
+  launch 'PX4-FLY 红气球识别' "cd '$REPO_DIR' && ./scripts/red_detector.sh"
+fi
 launch 'PX4-FLY 自主跟随' "cd '$REPO_DIR' && ./scripts/follow.sh"
 
 echo 'All PX4-FLY windows were launched.'

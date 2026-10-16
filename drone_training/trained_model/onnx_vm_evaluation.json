@@ -1,0 +1,11 @@
+{
+  "images": 114,
+  "true_positive": 90,
+  "false_positive": 1,
+  "false_negative": 10,
+  "confidence": 0.55,
+  "mean_iou": 0.8807099921270842,
+  "mean_inference_ms": 42.74522753507482,
+  "backend": "ONNX CPU, 416x416",
+  "gpu_training": "NVIDIA GeForce RTX 4060 Laptop GPU"
+}

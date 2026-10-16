@@ -28,6 +28,12 @@ class KeyboardControl(Node):
         super().__init__('px4_fly_keyboard_control',
                          parameter_overrides=[Parameter('use_sim_time', value=True)])
         self.declare_parameter('takeoff_altitude', 1.5)
+        self.declare_parameter('manual_step', 0.45)
+        self.declare_parameter('manual_lead_limit', 3.8)
+        for name in ('manual_step', 'manual_lead_limit'):
+            value = float(self.get_parameter(name).value)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f'{name} must be positive and finite')
         self.declare_parameter('yaw_rate_limit', 0.45)
         self.declare_parameter('yaw_acceleration_limit', 0.7)
         self.yaw_smoother = YawSmoother(
@@ -276,10 +282,12 @@ class KeyboardControl(Node):
             if key == ' ':
                 self.capture()
                 return
+            step = float(self.get_parameter('manual_step').value)
+            vertical_step = 0.25
             forward, right, up = {
-                'w': (0.25, 0, 0), 's': (-0.25, 0, 0),
-                'a': (0, -0.25, 0), 'd': (0, 0.25, 0),
-                'r': (0, 0, 0.25), 'f': (0, 0, -0.25),
+                'w': (step, 0, 0), 's': (-step, 0, 0),
+                'a': (0, -step, 0), 'd': (0, step, 0),
+                'r': (0, 0, vertical_step), 'f': (0, 0, -vertical_step),
             }.get(key, (0, 0, 0))
             heading = self.position.heading
             self.target[0] += forward * math.cos(heading) - right * math.sin(heading)
@@ -288,9 +296,10 @@ class KeyboardControl(Node):
             # Bound the accumulated position error during repeated key presses.
             dx, dy = self.target[0] - self.position.x, self.target[1] - self.position.y
             distance = math.hypot(dx, dy)
-            if distance > 2.0:
-                self.target[0] = self.position.x + dx * 2.0 / distance
-                self.target[1] = self.position.y + dy * 2.0 / distance
+            lead_limit = float(self.get_parameter('manual_lead_limit').value)
+            if distance > lead_limit:
+                self.target[0] = self.position.x + dx * lead_limit / distance
+                self.target[1] = self.position.y + dy * lead_limit / distance
             if key == 'j':
                 self.yaw -= math.radians(10)
             elif key == 'l':
